@@ -15,6 +15,24 @@ import re
 from datetime import datetime
 import sys
 
+# Import Rich for better debugging output
+from rich.console import Console as RichConsole
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
+from rich import print as rprint
+
+# Create a rich console for debugging
+debug_console = RichConsole()
+
+# Flag to enable rich debugging independently of log level
+RICH_DEBUG = True # Set to True to enable rich debugging by default
+
+# Flag to control newline handling in Together.ai responses
+PRESERVE_TOGETHER_FORMATTING = False # Set to False to process newlines for Together.ai
+# Flag to control OpenAI client newline handling
+PRESERVE_OPENAI_NEWLINES = False # Set to False to keep \n as \n in OpenAI responses
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -95,6 +113,7 @@ app = FastAPI()
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TOGETHERAI_API_KEY = os.environ.get("TOGETHERAI_API_KEY")
 
 # Get preferred provider (default to openai)
 PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
@@ -103,6 +122,9 @@ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
 # Default to latest OpenAI models if not set
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
+
+# Default Together.ai model
+TOGETHER_MODEL = os.environ.get("TOGETHER_MODEL", "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")
 
 # List of OpenAI models
 OPENAI_MODELS = [
@@ -125,6 +147,24 @@ GEMINI_MODELS = [
     "gemini-2.5-pro-preview-03-25",
     "gemini-2.0-flash"
 ]
+
+# List of Together.ai models
+TOGETHER_MODELS = [
+    "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+]
+
+# Helper function to ensure model name is compatible with Together.ai
+def ensure_together_model_format(model_name):
+    """Ensures model name is properly formatted for Together.ai API"""
+    # If model doesn't include organization prefix, add it
+    if "/" not in model_name and model_name not in ["llama-3-70b-chat", "llama-3-8b-chat"]:
+        logger.warning(f"Model {model_name} missing organization prefix, using with caution")
+    
+    # Strip together_ai/ prefix if it exists
+    if model_name.startswith("together_ai/"):
+        model_name = model_name[12:]
+    
+    return model_name
 
 # Helper function to clean schema for Gemini
 def clean_gemini_schema(schema: Any) -> Any:
@@ -218,12 +258,17 @@ class MessagesRequest(BaseModel):
             clean_v = clean_v[7:]
         elif clean_v.startswith('gemini/'):
             clean_v = clean_v[7:]
+        elif clean_v.startswith('together_ai/'):
+            clean_v = clean_v[12:]
 
         # --- Mapping Logic --- START ---
         mapped = False
         # Map Haiku to SMALL_MODEL based on provider preference
         if 'haiku' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
+            if PREFERRED_PROVIDER == "together":
+                new_model = f"together_ai/{TOGETHER_MODEL}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{SMALL_MODEL}"
                 mapped = True
             else:
@@ -232,7 +277,10 @@ class MessagesRequest(BaseModel):
 
         # Map Sonnet to BIG_MODEL based on provider preference
         elif 'sonnet' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
+            if PREFERRED_PROVIDER == "together":
+                new_model = f"together_ai/{TOGETHER_MODEL}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{BIG_MODEL}"
                 mapped = True
             else:
@@ -241,7 +289,10 @@ class MessagesRequest(BaseModel):
 
         # Add prefixes to non-mapped models if they match known lists
         elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith('gemini/'):
+            if clean_v in TOGETHER_MODELS and not v.startswith('together_ai/'):
+                new_model = f"together_ai/{clean_v}"
+                mapped = True # Technically mapped to add prefix
+            elif clean_v in GEMINI_MODELS and not v.startswith('gemini/'):
                 new_model = f"gemini/{clean_v}"
                 mapped = True # Technically mapped to add prefix
             elif clean_v in OPENAI_MODELS and not v.startswith('openai/'):
@@ -253,7 +304,7 @@ class MessagesRequest(BaseModel):
             logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}'")
         else:
              # If no mapping occurred and no prefix exists, log warning or decide default
-             if not v.startswith(('openai/', 'gemini/', 'anthropic/')):
+             if not v.startswith(('openai/', 'gemini/', 'anthropic/', 'together_ai/')):
                  logger.warning(f"⚠️ No prefix or mapping rule for model: '{original_model}'. Using as is.")
              new_model = v # Ensure we return the original if no rule applied
 
@@ -291,12 +342,17 @@ class TokenCountRequest(BaseModel):
             clean_v = clean_v[7:]
         elif clean_v.startswith('gemini/'):
             clean_v = clean_v[7:]
+        elif clean_v.startswith('together_ai/'):
+            clean_v = clean_v[12:]
 
         # --- Mapping Logic --- START ---
         mapped = False
         # Map Haiku to SMALL_MODEL based on provider preference
         if 'haiku' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
+            if PREFERRED_PROVIDER == "together":
+                new_model = f"together_ai/{TOGETHER_MODEL}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{SMALL_MODEL}"
                 mapped = True
             else:
@@ -305,7 +361,10 @@ class TokenCountRequest(BaseModel):
 
         # Map Sonnet to BIG_MODEL based on provider preference
         elif 'sonnet' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
+            if PREFERRED_PROVIDER == "together":
+                new_model = f"together_ai/{TOGETHER_MODEL}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{BIG_MODEL}"
                 mapped = True
             else:
@@ -314,7 +373,10 @@ class TokenCountRequest(BaseModel):
 
         # Add prefixes to non-mapped models if they match known lists
         elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith('gemini/'):
+            if clean_v in TOGETHER_MODELS and not v.startswith('together_ai/'):
+                new_model = f"together_ai/{clean_v}"
+                mapped = True # Technically mapped to add prefix
+            elif clean_v in GEMINI_MODELS and not v.startswith('gemini/'):
                 new_model = f"gemini/{clean_v}"
                 mapped = True # Technically mapped to add prefix
             elif clean_v in OPENAI_MODELS and not v.startswith('openai/'):
@@ -325,7 +387,7 @@ class TokenCountRequest(BaseModel):
         if mapped:
             logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}' ➡️ '{new_model}'")
         else:
-             if not v.startswith(('openai/', 'gemini/', 'anthropic/')):
+             if not v.startswith(('openai/', 'gemini/', 'anthropic/', 'together_ai/')):
                  logger.warning(f"⚠️ No prefix or mapping rule for token count model: '{original_model}'. Using as is.")
              new_model = v # Ensure we return the original if no rule applied
 
@@ -655,8 +717,23 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.top_k:
         litellm_request["top_k"] = anthropic_request.top_k
     
-    # Convert tools to OpenAI format
-    if anthropic_request.tools:
+    # Check if this is a Together.ai model - they don't support tools
+    is_together_model = anthropic_request.model.startswith("together_ai/")
+    
+    # Add rich debug logging for Together.ai models
+    if (is_together_model and log_level <= logging.DEBUG) or RICH_DEBUG:
+        debug_console.print(Panel(
+            f"[bold blue]Converting Anthropic request for Together.ai[/bold blue]\n"
+            f"Model: [cyan]{anthropic_request.model}[/cyan]\n"
+            f"Tools present: [{'yellow' if anthropic_request.tools else 'green'}]{bool(anthropic_request.tools)}[/{'yellow' if anthropic_request.tools else 'green'}]\n"
+            f"Message count: {len(anthropic_request.messages)}\n"
+            f"Max tokens: {anthropic_request.max_tokens}",
+            title="[bold]Together.ai Request Conversion[/bold]",
+            border_style="blue"
+        ))
+    
+    # Convert tools to OpenAI format - ONLY for non-Together.ai models
+    if anthropic_request.tools and not is_together_model:
         openai_tools = []
         is_gemini_model = anthropic_request.model.startswith("gemini/")
 
@@ -691,27 +768,59 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
         litellm_request["tools"] = openai_tools
     
-    # Convert tool_choice to OpenAI format if present
-    if anthropic_request.tool_choice:
-        if hasattr(anthropic_request.tool_choice, 'dict'):
-            tool_choice_dict = anthropic_request.tool_choice.dict()
-        else:
-            tool_choice_dict = anthropic_request.tool_choice
+        # Convert tool_choice to OpenAI format if present
+        if anthropic_request.tool_choice:
+            if hasattr(anthropic_request.tool_choice, 'dict'):
+                tool_choice_dict = anthropic_request.tool_choice.dict()
+            else:
+                tool_choice_dict = anthropic_request.tool_choice
+                
+            # Handle Anthropic's tool_choice format
+            choice_type = tool_choice_dict.get("type")
+            if choice_type == "auto":
+                litellm_request["tool_choice"] = "auto"
+            elif choice_type == "any":
+                litellm_request["tool_choice"] = "any"
+            elif choice_type == "tool" and "name" in tool_choice_dict:
+                litellm_request["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tool_choice_dict["name"]}
+                }
+            else:
+                # Default to auto if we can't determine
+                litellm_request["tool_choice"] = "auto"
+    elif is_together_model and anthropic_request.tools:
+        # Get the provider name for messages
+        provider_name = "Together.ai"
+        
+        # Log that we're skipping tools for the provider
+        logger.warning(f"Skipping tools parameter for {provider_name} model: {anthropic_request.model}")
+        # If tools are present but we're using Together.ai, add tool descriptions to system prompt instead
+        has_system = False
+        system_content = ""
+        
+        for idx, msg in enumerate(litellm_request["messages"]):
+            if msg.get("role") == "system":
+                has_system = True
+                system_content = msg.get("content", "")
+                break
+        
+        # Build tool description text
+        tool_text = "\n\nAvailable tools (these must be described in plain text since this model doesn't support function calling):\n"
+        for tool in anthropic_request.tools:
+            tool_dict = {}
+            if hasattr(tool, 'dict'):
+                tool_dict = tool.dict()
+            else:
+                tool_dict = dict(tool) if not isinstance(tool, dict) else tool
             
-        # Handle Anthropic's tool_choice format
-        choice_type = tool_choice_dict.get("type")
-        if choice_type == "auto":
-            litellm_request["tool_choice"] = "auto"
-        elif choice_type == "any":
-            litellm_request["tool_choice"] = "any"
-        elif choice_type == "tool" and "name" in tool_choice_dict:
-            litellm_request["tool_choice"] = {
-                "type": "function",
-                "function": {"name": tool_choice_dict["name"]}
-            }
+            tool_text += f"- {tool_dict.get('name', 'Unknown tool')}: {tool_dict.get('description', 'No description')}\n"
+        
+        # Add or append to system prompt
+        if has_system:
+            litellm_request["messages"][idx]["content"] = system_content + tool_text
         else:
-            # Default to auto if we can't determine
-            litellm_request["tool_choice"] = "auto"
+            litellm_request["messages"].insert(0, {"role": "system", "content": f"You are an AI assistant.{tool_text}"})
     
     return litellm_request
 
@@ -727,6 +836,8 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             clean_model = clean_model[len("anthropic/"):]
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/"):]
+        elif clean_model.startswith("together_ai/"):
+            clean_model = clean_model[len("together_ai/"):]
         
         # Check if this is a Claude model (which supports content blocks)
         is_claude_model = clean_model.startswith("claude-")
@@ -766,6 +877,64 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             finish_reason = choices[0].get("finish_reason", "stop") if choices and len(choices) > 0 else "stop"
             usage_info = response_dict.get("usage", {})
             response_id = response_dict.get("id", f"msg_{uuid.uuid4()}")
+        
+        # Process content text for Together.ai
+        # Together.ai might return newlines encoded as literal \n that need proper handling
+        if original_request.model.startswith("together_ai/") and isinstance(content_text, str):
+            # Get provider name for debug messages
+            provider_name = "Together.ai"
+            
+            # Only process newlines if PRESERVE_TOGETHER_FORMATTING is False
+            if not PRESERVE_TOGETHER_FORMATTING:
+                # Replace escaped newlines with actual newlines
+                if "\\n" in content_text:
+                    content_text = content_text.replace("\\n", "\n")
+                
+                # Fix markdown code blocks that might be malformed
+                if "```" in content_text:
+                    # Ensure code blocks have proper newlines
+                    content_text = re.sub(r'```(\w+)([^`]+)```', r'```\1\n\2\n```', content_text)
+                
+                if log_level <= logging.DEBUG or RICH_DEBUG:
+                    debug_console.print(Panel(
+                        f"[bold yellow]{provider_name} response transformed[/bold yellow]\n"
+                        f"Processing newlines for readability",
+                        title="[bold]Response Handling[/bold]",
+                        border_style="yellow"
+                    ))
+            else:
+                # Debug logging for content when preserving original formatting
+                if log_level <= logging.DEBUG or RICH_DEBUG:
+                    debug_console.print(Panel(
+                        f"[bold blue]{provider_name} response untransformed[/bold blue]\n"
+                        f"Preserving original formatting for Anthropic client",
+                        title="[bold]Response Handling[/bold]",
+                        border_style="cyan"
+                    ))
+        
+        # Process content text for OpenAI clients
+        # OpenAI clients may need to convert actual newlines to literal \n for proper display
+        elif not original_request.model.startswith("together_ai/") and isinstance(content_text, str) and not PRESERVE_OPENAI_NEWLINES:
+            # Get provider name for debug messages
+            provider_name = "OpenAI"
+            if original_request.model.startswith("openai/"):
+                provider_name = "OpenAI"
+            elif original_request.model.startswith("gemini/"):
+                provider_name = "Gemini"
+            elif original_request.model.startswith("anthropic/"):
+                provider_name = "Anthropic"
+            
+            # Replace actual newlines with literal \n for OpenAI output if needed
+            if "\n" in content_text:
+                content_text = content_text.replace("\n", "\\n")
+                
+                if log_level <= logging.DEBUG or RICH_DEBUG:
+                    debug_console.print(Panel(
+                        f"[bold green]{provider_name} response transformed[/bold green]\n"
+                        f"Converting actual newlines to \\n literals for OpenAI client display",
+                        title="[bold]Response Handling[/bold]",
+                        border_style="green"
+                    ))
         
         # Create content list for Anthropic format
         content = []
@@ -1060,7 +1229,17 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                     tool_id = getattr(tool_call, 'id', f"toolu_{uuid.uuid4().hex[:24]}")
                                 
                                 # Start a new tool_use block
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anthropic_tool_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {}}})}\n\n"
+                                content_block = {
+                                    'type': 'content_block_start', 
+                                    'index': anthropic_tool_index, 
+                                    'content_block': {
+                                        'type': 'tool_use', 
+                                        'id': tool_id, 
+                                        'name': name, 
+                                        'input': {}
+                                    }
+                                }
+                                yield f"event: content_block_start\ndata: {json.dumps(content_block)}\n\n"
                                 current_tool_call = tool_call
                                 tool_content = ""
                             
@@ -1196,6 +1375,10 @@ async def create_message(
             clean_model = clean_model[len("anthropic/"):]
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/"):]
+        elif clean_model.startswith("gemini/"):
+            clean_model = clean_model[len("gemini/"):]
+        elif clean_model.startswith("together_ai/"):
+            clean_model = clean_model[len("together_ai/"):]
         
         logger.debug(f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}")
         
@@ -1209,6 +1392,45 @@ async def create_message(
         elif request.model.startswith("gemini/"):
             litellm_request["api_key"] = GEMINI_API_KEY
             logger.debug(f"Using Gemini API key for model: {request.model}")
+        elif request.model.startswith("together_ai/"):
+            litellm_request["api_key"] = TOGETHERAI_API_KEY
+            # Explicitly set custom_llm_provider to "together_ai" (with underscore)
+            # This ensures consistency with LiteLLM's expected provider name
+            litellm_request["custom_llm_provider"] = "together_ai"
+            # Set the base_url for Together.ai API
+            litellm_request["base_url"] = "https://api.together.xyz/v1"
+            # Extract the model name without the provider prefix
+            model_name = request.model[len("together_ai/"):]
+            # Update the model name format for Together.ai
+            litellm_request["model"] = model_name
+            
+            # Rich debug information for Together.ai requests
+            if log_level <= logging.DEBUG or RICH_DEBUG:
+                provider_name = "Together.ai"
+                debug_table = Table(title=f"{provider_name} Request Details", show_header=True, header_style="bold magenta")
+                debug_table.add_column("Parameter", style="dim")
+                debug_table.add_column("Value")
+                
+                debug_table.add_row("Model", f"[cyan]{model_name}[/cyan]")
+                debug_table.add_row("Base URL", litellm_request["base_url"])
+                debug_table.add_row("Custom Provider", litellm_request["custom_llm_provider"])
+                debug_table.add_row("API Key (masked)", f"{TOGETHERAI_API_KEY[:5]}...{TOGETHERAI_API_KEY[-5:]}" if TOGETHERAI_API_KEY else "Not set")
+                
+                if "tools" in litellm_request:
+                    debug_table.add_row("Tools", "[yellow]Present but will be removed[/yellow]")
+                else:
+                    debug_table.add_row("Tools", "None")
+                
+                debug_console.print(Panel(debug_table, title=f"[bold green]{provider_name} Debug Info[/bold green]", 
+                                  subtitle="[dim]Tools are not supported and will be processed as text[/dim]"))
+                
+                # Also debug the first message content
+                if "messages" in litellm_request and litellm_request["messages"]:
+                    first_msg = litellm_request["messages"][0]
+                    content_preview = str(first_msg.get("content", ""))[:150] + "..." if len(str(first_msg.get("content", ""))) > 150 else str(first_msg.get("content", ""))
+                    debug_console.print(f"[bold blue]First Message[/bold blue]: role={first_msg.get('role', 'unknown')}, content={content_preview}")
+            
+            logger.debug(f"Using {provider_name} API key for model: {model_name}")
         else:
             litellm_request["api_key"] = ANTHROPIC_API_KEY
             logger.debug(f"Using Anthropic API key for model: {request.model}")
@@ -1444,8 +1666,41 @@ async def create_message(
                 num_tools,
                 200  # Assuming success at this point
             )
+            
+            # Rich debug for completion call
+            if log_level <= logging.DEBUG or RICH_DEBUG:
+                debug_console.print(Panel(
+                    "[bold cyan]Executing LiteLLM completion call[/bold cyan]",
+                    title="[bold]API Call[/bold]",
+                    border_style="green"
+                ))
+                
+                # Create a safe copy of the request for debugging (masking API key)
+                debug_request = litellm_request.copy()
+                if "api_key" in debug_request:
+                    key = debug_request["api_key"]
+                    if key:
+                        debug_request["api_key"] = f"{key[:5]}...{key[-5:]}" if len(key) > 10 else "***masked***"
+                
+                # Show important parameters
+                debug_table = Table(show_header=True, header_style="bold cyan", title="Request Parameters")
+                debug_table.add_column("Parameter", style="dim")
+                debug_table.add_column("Value")
+                
+                for key in ["model", "custom_llm_provider", "base_url", "temperature", "max_tokens"]:
+                    if key in debug_request:
+                        debug_table.add_row(key, str(debug_request[key]))
+                
+                debug_console.print(debug_table)
+                debug_console.print(f"[bold green]Starting completion call at {datetime.now().strftime('%H:%M:%S')}[/bold green]")
+            
             start_time = time.time()
             litellm_response = litellm.completion(**litellm_request)
+            end_time = time.time()
+            
+            if log_level <= logging.DEBUG or RICH_DEBUG:
+                debug_console.print(f"[bold green]✓ Completed in {end_time - start_time:.2f} seconds[/bold green]")
+            
             logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
             
             # Convert LiteLLM response to Anthropic format
@@ -1546,6 +1801,69 @@ async def create_message(
             if hasattr(e, attr):
                 error_details[attr] = getattr(e, attr)
         
+        # Special handling for Together.ai API errors
+        is_together_model = False
+        model_value = error_details.get('model')
+        llm_provider = error_details.get('llm_provider')
+        provider_name = "Together.ai"  # Default provider name
+        
+        # Check if this is a Together.ai model error
+        if isinstance(model_value, str) and any(model in model_value for model in TOGETHER_MODELS):
+            is_together_model = True
+        elif llm_provider == 'together_ai':
+            is_together_model = True
+            
+        if is_together_model:
+            logger.error(f"{provider_name} API error: {str(e)}")
+            
+            # Rich console error display for provider errors
+            error_panel = Panel(
+                f"[bold red]{provider_name} API Error:[/bold red]\n" 
+                f"[yellow]{str(e)}[/yellow]\n\n"
+                f"[bold]Possible causes:[/bold]\n"
+                f"• Invalid API key\n"
+                f"• Incorrect base URL\n"
+                f"• Model name format issue\n"
+                f"• Unsupported parameters in request",
+                title=f"[bold red]{provider_name} Error[/bold red]",
+                border_style="red"
+            )
+            debug_console.print(error_panel)
+            
+            # Rich table for error details
+            error_table = Table(show_header=True, header_style="bold red")
+            error_table.add_column("Error Property", style="dim")
+            error_table.add_column("Value")
+            
+            # Add common error properties
+            error_table.add_row("Error Type", type(e).__name__)
+            error_table.add_row("Status Code", str(error_details.get('status_code', 'Unknown')))
+            error_table.add_row("Model", model_value or "Unknown")
+            error_table.add_row("LLM Provider", llm_provider or "Unknown")
+            
+            # Add diagnostic information
+            if "base_url" in litellm_request:
+                error_table.add_row("Base URL", litellm_request.get("base_url", "Not set"))
+            else:
+                error_table.add_row("Base URL", "[bold red]Missing - this may be the issue![/bold red]")
+                
+            if "custom_llm_provider" in litellm_request:
+                error_table.add_row("Custom Provider", litellm_request.get("custom_llm_provider", "Not set"))
+            else:
+                error_table.add_row("Custom Provider", "[bold red]Missing - this may be the issue![/bold red]")
+            
+            # Display the error details
+            debug_console.print(error_table)
+            
+            # Check if it's a rate limit or authentication error
+            if hasattr(e, 'status_code'):
+                if e.status_code == 429:
+                    error_details["provider_error"] = f"Rate limit exceeded. Please try again later."
+                elif e.status_code == 401:
+                    error_details["provider_error"] = f"Authentication failed. Please check your {provider_name} API key."
+                elif e.status_code == 404:
+                    error_details["provider_error"] = f"Model not found. Please check if the model name is correct."
+        
         # Check for additional exception details in dictionaries
         if hasattr(e, '__dict__'):
             for key, value in e.__dict__.items():
@@ -1595,6 +1913,10 @@ async def count_tokens(
             clean_model = clean_model[len("anthropic/"):]
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/"):]
+        elif clean_model.startswith("gemini/"):
+            clean_model = clean_model[len("gemini/"):]
+        elif clean_model.startswith("together_ai/"):
+            clean_model = clean_model[len("together_ai/"):]
         
         # Convert the messages to a format LiteLLM can understand
         converted_request = convert_anthropic_to_litellm(
@@ -1626,6 +1948,42 @@ async def count_tokens(
                 num_tools,
                 200  # Assuming success at this point
             )
+            
+            # Special handling for Together.ai models
+            if request.model.startswith("together_ai/"):
+                # Get the provider name for debug messages
+                provider_name = "Together.ai"
+                
+                # Similar to create_message function, update the request for Together.ai
+                converted_request["custom_llm_provider"] = "together_ai"
+                converted_request["base_url"] = "https://api.together.xyz/v1"
+                # Extract model name without provider prefix
+                model_name = converted_request["model"]
+                if model_name.startswith("together_ai/"):
+                    model_name = model_name[len("together_ai/"):]
+                    converted_request["model"] = model_name
+                
+                # Rich debug information for token counting
+                if log_level <= logging.DEBUG or RICH_DEBUG:
+                    debug_console.print(Panel(
+                        f"[bold blue]{provider_name} Token Counting[/bold blue]\n"
+                        f"Original model: [cyan]{request.model}[/cyan]\n"
+                        f"Converted model: [cyan]{model_name}[/cyan]\n"
+                        f"Base URL: {converted_request['base_url']}\n"
+                        f"Custom Provider: {converted_request['custom_llm_provider']}",
+                        title="[bold]Token Count Configuration[/bold]",
+                        border_style="cyan"
+                    ))
+                    
+                    # Check for potential issues
+                    warnings = []
+                    if not TOGETHERAI_API_KEY:
+                        warnings.append(f"[bold red]{provider_name} API key is not set![/bold red]")
+                    
+                    if warnings:
+                        debug_console.print("[bold yellow]⚠️ Warnings:[/bold yellow]")
+                        for warning in warnings:
+                            debug_console.print(f" • {warning}")
             
             # Count tokens
             token_count = token_counter(
@@ -1700,7 +2058,35 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--help":
         print("Run with: uvicorn server:app --reload --host 0.0.0.0 --port 8082")
+        print("Additional options:")
+        print("  --debug-rich    Enable rich console debugging output")
+        print("  --process-newlines  Process newlines in Together.ai responses")
+        print("  --preserve-openai-newlines  Keep newlines as-is in OpenAI client responses")
         sys.exit(0)
+    
+    # Check for rich debug flag
+    if "--debug-rich" in sys.argv:
+        # Configure rich console to show debugging info regardless of log level
+        debug_console.print(Panel(
+            "[bold green]Rich debugging enabled[/bold green]\n"
+            "You will see detailed debugging information for API calls, especially for Together.ai",
+            title="[bold]Debug Mode[/bold]",
+            border_style="green"
+        ))
+        # Override log level for rich console
+        RICH_DEBUG = True
+    else:
+        RICH_DEBUG = False
+    
+    # Check for newline processing flag
+    if "--process-newlines" in sys.argv:
+        PRESERVE_TOGETHER_FORMATTING = False
+        print("Together.ai newline processing enabled - newlines will be transformed")
+    
+    # Check for OpenAI newline preservation flag
+    if "--preserve-openai-newlines" in sys.argv:
+        PRESERVE_OPENAI_NEWLINES = True
+        print("OpenAI newline preservation enabled - newlines will be kept as-is")
     
     # Configure uvicorn to run with minimal logs
     uvicorn.run(app, host="0.0.0.0", port=8082, log_level="error")
