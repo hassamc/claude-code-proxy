@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response, BackgroundTasks
 import uvicorn
 import logging
 import json
@@ -14,13 +14,16 @@ from dotenv import load_dotenv
 import re
 from datetime import datetime
 import sys
+import openai
+import asyncio
 
 # Import Rich for better debugging output
 from rich.console import Console as RichConsole
 from rich.panel import Panel
 from rich.syntax import Syntax
-from rich.table import Table
+from rich.table import Table, Column
 from rich import print as rprint
+from rich.console import Group
 
 # Create a rich console for debugging
 debug_console = RichConsole()
@@ -477,9 +480,122 @@ def parse_tool_result_content(content):
     except:
         return "Unparseable content"
 
+def detect_tool_calls_in_text(text_content):
+    """
+    Parse text output from Together.ai models to detect intended function calls.
+    Returns a list of detected tool calls in a format compatible with OpenAI's tool_calls.
+    """
+    try:
+        tool_calls = []
+        
+        # Pattern 1: Look for markdown-style code blocks with JSON
+        # Example: ```json\n{"tool": "weather", "params": {"location": "New York"}}\n```
+        code_block_pattern = r"```(?:json)?\s*\n(.*?)\n```"
+        code_blocks = re.findall(code_block_pattern, text_content, re.DOTALL)
+        
+        # Pattern 2: Look for explicit function call syntax
+        # Example: USE_TOOL: calculator PARAMETERS: {"x": 5, "y": 10, "operation": "multiply"}
+        function_pattern = r"USE_TOOL:\s*(\w+)\s*PARAMETERS:\s*(\{.*?\})"
+        function_matches = re.findall(function_pattern, text_content, re.DOTALL)
+        
+        # Pattern 3: Look for natural language function references with JSON-like content
+        # Example: I'll use the weather tool with parameters: {"location": "New York"}
+        nl_pattern = r"use the (\w+) tool with parameters:?\s*(\{.*?\})"
+        nl_matches = re.findall(nl_pattern, text_content, re.IGNORECASE | re.DOTALL)
+        
+        # Process code blocks as potential tool calls
+        for block in code_blocks:
+            try:
+                # Try to parse as JSON
+                tool_data = json.loads(block.strip())
+                if isinstance(tool_data, dict) and "tool" in tool_data and "params" in tool_data:
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "function": {
+                            "name": tool_data["tool"],
+                            "arguments": json.dumps(tool_data["params"])
+                        }
+                    })
+            except json.JSONDecodeError:
+                # Not valid JSON, skip
+                continue
+        
+        # Process explicit function calls
+        for name, args_str in function_matches:
+            try:
+                # Try to parse arguments as JSON
+                args = json.loads(args_str.strip())
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args)
+                    }
+                })
+            except json.JSONDecodeError:
+                # Not valid JSON, try to fix common issues and retry
+                fixed_args_str = fix_json_string(args_str)
+                try:
+                    args = json.loads(fixed_args_str)
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args)
+                        }
+                    })
+                except json.JSONDecodeError:
+                    # Still not valid, skip
+                    continue
+        
+        # Process natural language matches
+        for name, args_str in nl_matches:
+            try:
+                # Try to parse arguments as JSON
+                args = json.loads(args_str.strip())
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args)
+                    }
+                })
+            except json.JSONDecodeError:
+                # Not valid JSON, try to fix common issues and retry
+                fixed_args_str = fix_json_string(args_str)
+                try:
+                    args = json.loads(fixed_args_str)
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args)
+                        }
+                    })
+                except json.JSONDecodeError:
+                    # Still not valid, skip
+                    continue
+        
+        return tool_calls
+    except Exception as e:
+        logger.error(f"Error detecting tool calls: {str(e)}")
+        # Log the problematic text for debugging
+        logger.debug(f"Text content that caused error: {text_content[:500]}...")
+        return []  # Return empty list on error
+
+def fix_json_string(json_str):
+    """Attempt to fix common JSON formatting issues"""
+    # Replace single quotes with double quotes
+    fixed = re.sub(r"'([^']*)'", r'"\1"', json_str)
+    # Ensure property names are properly quoted
+    fixed = re.sub(r'(\w+):', r'"\1":', fixed)
+    # Remove trailing commas
+    fixed = re.sub(r',\s*}', '}', fixed)
+    return fixed
+
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     """Convert Anthropic API request format to LiteLLM format (which follows OpenAI)."""
-    # LiteLLM already handles Anthropic models when using the format model="anthropic/claude-3-opus-20240229"
+    # LiteLLM already handles Anthropic models when using the format model="anthropic/claude-x" format
     # So we just need to convert our Pydantic model to a dict in the expected format
     
     messages = []
@@ -525,41 +641,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                             tool_id = block.tool_use_id if hasattr(block, "tool_use_id") else ""
                             
                             # Handle different formats of tool result content
-                            result_content = ""
-                            if hasattr(block, "content"):
-                                if isinstance(block.content, str):
-                                    result_content = block.content
-                                elif isinstance(block.content, list):
-                                    # If content is a list of blocks, extract text from each
-                                    for content_block in block.content:
-                                        if hasattr(content_block, "type") and content_block.type == "text":
-                                            result_content += content_block.text + "\n"
-                                        elif isinstance(content_block, dict) and content_block.get("type") == "text":
-                                            result_content += content_block.get("text", "") + "\n"
-                                        elif isinstance(content_block, dict):
-                                            # Handle any dict by trying to extract text or convert to JSON
-                                            if "text" in content_block:
-                                                result_content += content_block.get("text", "") + "\n"
-                                            else:
-                                                try:
-                                                    result_content += json.dumps(content_block) + "\n"
-                                                except:
-                                                    result_content += str(content_block) + "\n"
-                                elif isinstance(block.content, dict):
-                                    # Handle dictionary content
-                                    if block.content.get("type") == "text":
-                                        result_content = block.content.get("text", "")
-                                    else:
-                                        try:
-                                            result_content = json.dumps(block.content)
-                                        except:
-                                            result_content = str(block.content)
-                                else:
-                                    # Handle any other type by converting to string
-                                    try:
-                                        result_content = str(block.content)
-                                    except:
-                                        result_content = "Unparseable content"
+                            result_content = parse_tool_result_content(block.content)
                             
                             # In OpenAI format, tool results come from the user (rather than being content blocks)
                             text_content += f"Tool result for {tool_id}:\n{result_content}\n"
@@ -591,19 +673,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                             }
                             
                             # Process the content field properly
-                            if hasattr(block, "content"):
-                                if isinstance(block.content, str):
-                                    # If it's a simple string, create a text block for it
-                                    processed_content_block["content"] = [{"type": "text", "text": block.content}]
-                                elif isinstance(block.content, list):
-                                    # If it's already a list of blocks, keep it
-                                    processed_content_block["content"] = block.content
-                                else:
-                                    # Default fallback
-                                    processed_content_block["content"] = [{"type": "text", "text": str(block.content)}]
-                            else:
-                                # Default empty content
-                                processed_content_block["content"] = [{"type": "text", "text": ""}]
+                            processed_content_block["content"] = parse_tool_result_content(block.content)
                                 
                             processed_content.append(processed_content_block)
                 
@@ -618,7 +688,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     
     # Create LiteLLM request dict
     litellm_request = {
-        "model": anthropic_request.model,  # t understands "anthropic/claude-x" format
+        "model": anthropic_request.model,  # it understands "anthropic/claude-x" format
         "messages": messages,
         "stream": anthropic_request.stream,
     }
@@ -717,7 +787,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.top_k:
         litellm_request["top_k"] = anthropic_request.top_k
     
-    # Check if this is a Together.ai model - they don't support tools
+    # Check if this is a Together.ai model
     is_together_model = anthropic_request.model.startswith("together_ai/")
     
     # Add rich debug logging for Together.ai models
@@ -732,8 +802,8 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             border_style="blue"
         ))
     
-    # Convert tools to OpenAI format - ONLY for non-Together.ai models
-    if anthropic_request.tools and not is_together_model:
+    # Convert tools to OpenAI format for ALL models including Together.ai
+    if anthropic_request.tools:
         openai_tools = []
         is_gemini_model = anthropic_request.model.startswith("gemini/")
 
@@ -742,7 +812,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             if hasattr(tool, 'dict'):
                 tool_dict = tool.dict()
             else:
-                # Ensure tool_dict is a dictionary, handle potential errors if 'tool' isn't dict-like
+                # Ensure tool_dict is a dictionary
                 try:
                     tool_dict = dict(tool) if not isinstance(tool, dict) else tool
                 except (TypeError, ValueError):
@@ -780,7 +850,8 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             if choice_type == "auto":
                 litellm_request["tool_choice"] = "auto"
             elif choice_type == "any":
-                litellm_request["tool_choice"] = "any"
+                litellm_request["tool_choice"] = "auto"
+                logger.info("Mapping tool_choice 'any' to 'auto' for Together.ai")
             elif choice_type == "tool" and "name" in tool_choice_dict:
                 litellm_request["tool_choice"] = {
                     "type": "function",
@@ -789,38 +860,81 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             else:
                 # Default to auto if we can't determine
                 litellm_request["tool_choice"] = "auto"
-    elif is_together_model and anthropic_request.tools:
-        # Get the provider name for messages
-        provider_name = "Together.ai"
-        
-        # Log that we're skipping tools for the provider
-        logger.warning(f"Skipping tools parameter for {provider_name} model: {anthropic_request.model}")
-        # If tools are present but we're using Together.ai, add tool descriptions to system prompt instead
-        has_system = False
-        system_content = ""
-        
-        for idx, msg in enumerate(litellm_request["messages"]):
-            if msg.get("role") == "system":
-                has_system = True
-                system_content = msg.get("content", "")
-                break
-        
-        # Build tool description text
-        tool_text = "\n\nAvailable tools (these must be described in plain text since this model doesn't support function calling):\n"
-        for tool in anthropic_request.tools:
-            tool_dict = {}
-            if hasattr(tool, 'dict'):
-                tool_dict = tool.dict()
-            else:
-                tool_dict = dict(tool) if not isinstance(tool, dict) else tool
-            
-            tool_text += f"- {tool_dict.get('name', 'Unknown tool')}: {tool_dict.get('description', 'No description')}\n"
-        
-        # Add or append to system prompt
-        if has_system:
-            litellm_request["messages"][idx]["content"] = system_content + tool_text
         else:
-            litellm_request["messages"].insert(0, {"role": "system", "content": f"You are an AI assistant.{tool_text}"})
+            # Set default tool_choice to auto if tools are provided but no explicit choice
+            litellm_request["tool_choice"] = "auto"
+            
+        # Special handling for Together.ai with tools - enhanced system prompt
+        if is_together_model:
+            # Get the original system prompt, or create a new one
+            system_prompt = ""
+            system_msg_idx = -1
+            
+            for idx, msg in enumerate(litellm_request["messages"]):
+                if msg.get("role") == "system":
+                    system_msg_idx = idx
+                    system_prompt = msg.get("content", "")
+                    break
+            
+            # Add specific Together.ai function calling instructions to help guide the model
+            function_calling_instructions = """
+When you use tools/functions, ensure you follow these guidelines:
+1. Call one function at a time
+2. Wait for the result before calling another function
+3. Format function calls using the API's native function calling capability
+4. Do not format function calls as text or code blocks
+"""
+            
+            # Update the system prompt
+            if system_msg_idx >= 0:
+                litellm_request["messages"][system_msg_idx]["content"] = system_prompt + "\n\n" + function_calling_instructions
+            else:
+                litellm_request["messages"].insert(0, {"role": "system", "content": "You are a helpful assistant.\n\n" + function_calling_instructions})
+                
+            # Log what we're doing
+            logger.info(f"Using native function calling for Together.ai model with {len(openai_tools)} tools")
+    
+    # Special handling for Together.ai models
+    if is_together_model:
+        # Update the model name for Together.ai
+        # Strip the provider prefix
+        if litellm_request["model"].startswith("together_ai/"):
+            litellm_request["model"] = litellm_request["model"][len("together_ai/"):]
+        
+        # Set provider explicitly to together_ai
+        litellm_request["custom_llm_provider"] = "together_ai"
+        
+        # Set the base URL for Together API
+        litellm_request["base_url"] = "https://api.together.xyz/v1"
+        
+        # Set API key
+        litellm_request["api_key"] = TOGETHERAI_API_KEY
+        
+        if log_level <= logging.DEBUG or RICH_DEBUG:
+            # Create a sanitized version of the request for debug output
+            debug_request = litellm_request.copy()
+            if "api_key" in debug_request:
+                api_key = debug_request["api_key"]
+                if api_key:
+                    debug_request["api_key"] = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else "***masked***"
+            
+            # Show details about the configured tools
+            tools_info = ""
+            if "tools" in litellm_request:
+                tool_count = len(litellm_request["tools"])
+                tool_names = [t["function"]["name"] for t in litellm_request["tools"]]
+                tools_info = f"\nTools ({tool_count}): {', '.join(tool_names)}\n"
+                tools_info += f"Tool choice: {litellm_request.get('tool_choice', 'auto')}"
+            
+            debug_console.print(Panel(
+                f"[bold green]Together.ai Native Function Calling[/bold green]\n"
+                f"Model: [cyan]{litellm_request['model']}[/cyan]\n"
+                f"API Key: {debug_request.get('api_key', 'Not set')}\n"
+                f"Provider: {litellm_request.get('custom_llm_provider')}\n"
+                f"Base URL: {litellm_request.get('base_url')}{tools_info}",
+                title="[bold]Together.ai Configuration[/bold]",
+                border_style="green"
+            ))
     
     return litellm_request
 
@@ -884,6 +998,78 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             # Get provider name for debug messages
             provider_name = "Together.ai"
             
+            # Special handling for Together.ai models to detect tool calls in text content
+            # First check if there were tools in the original request
+            has_tools = original_request.tools and len(original_request.tools) > 0
+            
+            if has_tools:
+                # Detect tool calls in the model's text output
+                detected_tool_calls = detect_tool_calls_in_text(content_text)
+                
+                if detected_tool_calls:
+                    # Log that we detected tool calls
+                    if log_level <= logging.DEBUG or RICH_DEBUG:
+                        debug_console.print(Panel(
+                            f"[bold green]{provider_name} tool calls detected[/bold green]\n"
+                            f"Found {len(detected_tool_calls)} tool call(s) in text response",
+                            title="[bold]Tool Call Detection[/bold]",
+                            border_style="green"
+                        ))
+                        
+                        # Show the detected tool calls
+                        for i, call in enumerate(detected_tool_calls):
+                            debug_console.print(f"[bold]Tool Call {i+1}:[/bold]")
+                            debug_console.print(f"Name: {call['function']['name']}")
+                            debug_console.print(f"Arguments: {call['function']['arguments']}")
+                    
+                    # If we're using a Claude model as the output format, add proper tool_use blocks
+                    if is_claude_model:
+                        # Add detected tool calls as tool_use blocks
+                        for tool_call in detected_tool_calls:
+                            # Extract function data
+                            tool_id = tool_call.get("id", f"tool_{uuid.uuid4()}")
+                            name = tool_call['function']['name']
+                            arguments_str = tool_call['function']['arguments']
+                            
+                            # Convert arguments string to dict
+                            try:
+                                arguments = json.loads(arguments_str)
+                            except json.JSONDecodeError:
+                                arguments = {"raw": arguments_str}
+                            
+                            # Add tool_use block
+                            content.append({
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": name,
+                                "input": arguments
+                            })
+                    
+                        # Extract text content without the tool calls to avoid duplication
+                        if detected_tool_calls and content and content[0]["type"] == "text":
+                            # Remove the tool call parts from the text content
+                            cleaned_text = content_text
+                            
+                            # Remove code blocks with JSON
+                            cleaned_text = re.sub(r"```(?:json)?\s*\n.*?\n```", "[Tool Call Removed]", cleaned_text, flags=re.DOTALL)
+                            
+                            # Remove explicit function calls
+                            cleaned_text = re.sub(r"USE_TOOL:\s*\w+\s*PARAMETERS:\s*\{.*?\}", "[Tool Call Removed]", cleaned_text, flags=re.DOTALL)
+                            
+                            # Remove natural language function references
+                            cleaned_text = re.sub(r"use the \w+ tool with parameters:?\s*\{.*?\}", "[Tool Call Removed]", cleaned_text, flags=re.IGNORECASE | re.DOTALL)
+                            
+                            # Clean up any artifact double-spaces or empty lines
+                            cleaned_text = re.sub(r"\n\s*\n", "\n\n", cleaned_text)
+                            cleaned_text = re.sub(r"\[Tool Call Removed\]\s*\[Tool Call Removed\]", "[Tool Call Removed]", cleaned_text)
+                            
+                            # Update the text content
+                            content[0]["text"] = cleaned_text.strip()
+                    
+                    # Set stop reason to "tool_use" if we detected tool calls
+                    if detected_tool_calls:
+                        stop_reason = "tool_use"
+        
             # Only process newlines if PRESERVE_TOGETHER_FORMATTING is False
             if not PRESERVE_TOGETHER_FORMATTING:
                 # Replace escaped newlines with actual newlines
@@ -943,8 +1129,8 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
         if content_text is not None and content_text != "":
             content.append({"type": "text", "text": content_text})
         
-        # Add tool calls if present (tool_use in Anthropic format) - only for Claude models
-        if tool_calls and is_claude_model:
+        # Add tool calls if present (tool_use in Anthropic format) - for all models including Together.ai
+        if tool_calls:
             logger.debug(f"Processing tool calls: {tool_calls}")
             
             # Convert to list if it's not already
@@ -982,47 +1168,6 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
                     "name": name,
                     "input": arguments
                 })
-        elif tool_calls and not is_claude_model:
-            # For non-Claude models, convert tool calls to text format
-            logger.debug(f"Converting tool calls to text for non-Claude model: {clean_model}")
-            
-            # We'll append tool info to the text content
-            tool_text = "\n\nTool usage:\n"
-            
-            # Convert to list if it's not already
-            if not isinstance(tool_calls, list):
-                tool_calls = [tool_calls]
-                
-            for idx, tool_call in enumerate(tool_calls):
-                # Extract function data based on whether it's a dict or object
-                if isinstance(tool_call, dict):
-                    function = tool_call.get("function", {})
-                    tool_id = tool_call.get("id", f"tool_{uuid.uuid4()}")
-                    name = function.get("name", "")
-                    arguments = function.get("arguments", "{}")
-                else:
-                    function = getattr(tool_call, "function", None)
-                    tool_id = getattr(tool_call, "id", f"tool_{uuid.uuid4()}")
-                    name = getattr(function, "name", "") if function else ""
-                    arguments = getattr(function, "arguments", "{}") if function else "{}"
-                
-                # Convert string arguments to dict if needed
-                if isinstance(arguments, str):
-                    try:
-                        args_dict = json.loads(arguments)
-                        arguments_str = json.dumps(args_dict, indent=2)
-                    except json.JSONDecodeError:
-                        arguments_str = arguments
-                else:
-                    arguments_str = json.dumps(arguments, indent=2)
-                
-                tool_text += f"Tool: {name}\nArguments: {arguments_str}\n\n"
-            
-            # Add or append tool text to content
-            if content and content[0]["type"] == "text":
-                content[0]["text"] += tool_text
-            else:
-                content.append({"type": "text", "text": tool_text})
         
         # Get usage information - extract values safely from object or dict
         if isinstance(usage_info, dict):
@@ -1080,284 +1225,682 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
         )
 
 async def handle_streaming(response_generator, original_request: MessagesRequest):
-    """Handle streaming responses from LiteLLM and convert to Anthropic format."""
+    """
+    Process the streaming response from LiteLLM and convert it to Anthropic's streaming format.
+    """
     try:
-        # Send message_start event
-        message_id = f"msg_{uuid.uuid4().hex[:24]}"  # Format similar to Anthropic's IDs
+        # Initialize variables to track state across chunks
+        content_blocks = {}  # Store content blocks by index
+        tool_index = None  # Current tool index being processed
+        last_tool_index = -1  # Highest tool index seen
+        has_sent_stop_reason = False  # Whether we've sent a stop reason
+        output_tokens = 0  # Count tokens for final usage info
         
-        message_data = {
-            'type': 'message_start',
-            'message': {
-                'id': message_id,
-                'type': 'message',
-                'role': 'assistant',
-                'model': original_request.model,
-                'content': [],
-                'stop_reason': None,
-                'stop_sequence': None,
-                'usage': {
-                    'input_tokens': 0,
-                    'cache_creation_input_tokens': 0,
-                    'cache_read_input_tokens': 0,
-                    'output_tokens': 0
-                }
-            }
-        }
-        yield f"event: message_start\ndata: {json.dumps(message_data)}\n\n"
-        
-        # Content block index for the first text block
-        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-        
-        # Send a ping to keep the connection alive (Anthropic does this)
-        yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
-        
-        tool_index = None
-        current_tool_call = None
-        tool_content = ""
-        accumulated_text = ""  # Track accumulated text content
-        text_sent = False  # Track if we've sent any text content
-        text_block_closed = False  # Track if text block is closed
-        input_tokens = 0
-        output_tokens = 0
-        has_sent_stop_reason = False
-        last_tool_index = 0
-        
-        # Process each chunk
-        async for chunk in response_generator:
-            try:
+        # Special tracking for Together.ai with tools
+        is_together_model = original_request.model.startswith("together_ai/")
+        has_tools = original_request.tools and len(original_request.tools) > 0
+        accumulated_text = "" if (is_together_model and has_tools) else None
+        detected_tool_calls = []
+        text_sent = False
+        text_block_closed = False
 
+        # Process each chunk in the streaming response
+        async for chunk in response_generator:
+            # Count output tokens
+            delta = chunk.choices[0].delta if hasattr(chunk.choices[0], 'delta') else {}
+            if hasattr(delta, 'content') and delta.content:
+                output_tokens += 1  # Simple approximation
                 
-                # Check if this is the end of the response with usage data
-                if hasattr(chunk, 'usage') and chunk.usage is not None:
-                    if hasattr(chunk.usage, 'prompt_tokens'):
-                        input_tokens = chunk.usage.prompt_tokens
-                    if hasattr(chunk.usage, 'completion_tokens'):
-                        output_tokens = chunk.usage.completion_tokens
+                # For Together.ai with tools, accumulate text
+                if is_together_model and has_tools:
+                    accumulated_text += delta.content
+
+            # Extract message data from the chunk
+            message = chunk.choices[0].delta if hasattr(chunk.choices[0], 'delta') else None
+            content = message.content if message and hasattr(message, 'content') else None
+            
+            # Handle tool calls
+            tool_calls = message.tool_calls if message and hasattr(message, 'tool_calls') else None
+            
+            # Check if this is the start of the response
+            if content and tool_index is None:
+                # Start with text content at index 0
+                tool_index = 0
+                text_sent = True
                 
-                # Handle text content
-                if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
-                    choice = chunk.choices[0]
+                # Send message_start event
+                yield f"event: message_start\ndata: {json.dumps({'type': 'message_start'})}\n\n"
+                
+                # Start a text content block
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text'}})}\n\n"
+                
+                # Set up the first content block
+                content_blocks[0] = {"type": "text", "text": ""}
+            
+            # Process text content
+            if content:
+                # Ensure we have a text block
+                if 0 not in content_blocks:
+                    # First text - start a message and content block
+                    tool_index = 0
+                    text_sent = True
+                    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start'})}\n\n"
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text'}})}\n\n"
+                    content_blocks[0] = {"type": "text", "text": ""}
+                
+                # Add to the text content
+                content_blocks[0]["text"] += content
+                
+                # Send content delta
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
+                
+                # Check for Together.ai tool calls in accumulated text
+                if is_together_model and has_tools and accumulated_text and not detected_tool_calls:
+                    # Check for complete tool call patterns
+                    # We need to be careful about detecting complete patterns, not partial ones
+                    complete_json_block = re.search(r"```(?:json)?\s*\n(\{.*?\})\s*\n```", accumulated_text, re.DOTALL)
+                    complete_function_call = re.search(r"USE_TOOL:\s*(\w+)\s*PARAMETERS:\s*(\{.*?\})", accumulated_text, re.DOTALL)
                     
-                    # Get the delta from the choice
-                    if hasattr(choice, 'delta'):
-                        delta = choice.delta
-                    else:
-                        # If no delta, try to get message
-                        delta = getattr(choice, 'message', {})
-                    
-                    # Check for finish_reason to know when we're done
-                    finish_reason = getattr(choice, 'finish_reason', None)
-                    
-                    # Process text content
-                    delta_content = None
-                    
-                    # Handle different formats of delta content
-                    if hasattr(delta, 'content'):
-                        delta_content = delta.content
-                    elif isinstance(delta, dict) and 'content' in delta:
-                        delta_content = delta['content']
-                    
-                    # Accumulate text content
-                    if delta_content is not None and delta_content != "":
-                        accumulated_text += delta_content
+                    if complete_json_block or complete_function_call:
+                        # We've found a complete tool call pattern
+                        tool_calls_found = detect_tool_calls_in_text(accumulated_text)
                         
-                        # Always emit text deltas if no tool calls started
-                        if tool_index is None and not text_block_closed:
-                            text_sent = True
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
-                    
-                    # Process tool calls
-                    delta_tool_calls = None
-                    
-                    # Handle different formats of tool calls
-                    if hasattr(delta, 'tool_calls'):
-                        delta_tool_calls = delta.tool_calls
-                    elif isinstance(delta, dict) and 'tool_calls' in delta:
-                        delta_tool_calls = delta['tool_calls']
-                    
-                    # Process tool calls if any
-                    if delta_tool_calls:
-                        # First tool call we've seen - need to handle text properly
-                        if tool_index is None:
-                            # If we've been streaming text, close that text block
-                            if text_sent and not text_block_closed:
-                                text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                            # If we've accumulated text but not sent it, we need to emit it now
-                            # This handles the case where the first delta has both text and a tool call
-                            elif accumulated_text and not text_sent and not text_block_closed:
-                                # Send the accumulated text
-                                text_sent = True
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
-                                # Close the text block
-                                text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                            # Close text block even if we haven't sent anything - models sometimes emit empty text blocks
-                            elif not text_block_closed:
+                        if tool_calls_found:
+                            # First time we've found tool calls
+                            detected_tool_calls = tool_calls_found
+                            
+                            # Close the text block if it was active
+                            if not text_block_closed:
                                 text_block_closed = True
                                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
                                 
-                        # Convert to list if it's not already
-                        if not isinstance(delta_tool_calls, list):
-                            delta_tool_calls = [delta_tool_calls]
-                        
-                        for tool_call in delta_tool_calls:
-                            # Get the index of this tool call (for multiple tools)
-                            current_index = None
-                            if isinstance(tool_call, dict) and 'index' in tool_call:
-                                current_index = tool_call['index']
-                            elif hasattr(tool_call, 'index'):
-                                current_index = tool_call.index
-                            else:
-                                current_index = 0
+                                # Create a cleaned version of text content without the tool calls
+                                cleaned_text = accumulated_text
+                                cleaned_text = re.sub(r"```(?:json)?\s*\n.*?\n```", "[Tool Call Removed]", cleaned_text, flags=re.DOTALL)
+                                cleaned_text = re.sub(r"USE_TOOL:\s*\w+\s*PARAMETERS:\s*\{.*?\}", "[Tool Call Removed]", cleaned_text, flags=re.DOTALL)
+                                cleaned_text = re.sub(r"use the \w+ tool with parameters:?\s*\{.*?\}", "[Tool Call Removed]", cleaned_text, flags=re.IGNORECASE | re.DOTALL)
+                                cleaned_text = re.sub(r"\n\s*\n", "\n\n", cleaned_text)
+                                
+                                # Replace content_blocks[0] with cleaned text
+                                content_blocks[0]["text"] = cleaned_text.strip()
                             
-                            # Check if this is a new tool or a continuation
-                            if tool_index is None or current_index != tool_index:
-                                # New tool call - create a new tool_use block
-                                tool_index = current_index
-                                last_tool_index += 1
-                                anthropic_tool_index = last_tool_index
+                            # Start tool_use blocks for each detected tool call
+                            for i, tool_call in enumerate(detected_tool_calls):
+                                tool_index = i + 1
+                                last_tool_index = max(last_tool_index, tool_index)
                                 
                                 # Extract function info
-                                if isinstance(tool_call, dict):
-                                    function = tool_call.get('function', {})
-                                    name = function.get('name', '') if isinstance(function, dict) else ""
-                                    tool_id = tool_call.get('id', f"toolu_{uuid.uuid4().hex[:24]}")
-                                else:
-                                    function = getattr(tool_call, 'function', None)
-                                    name = getattr(function, 'name', '') if function else ''
-                                    tool_id = getattr(tool_call, 'id', f"toolu_{uuid.uuid4().hex[:24]}")
+                                function = tool_call.get('function', {})
+                                name = function.get('name', '')
+                                tool_id = tool_call.get('id', f"tool_{uuid.uuid4().hex[:8]}")
                                 
                                 # Start a new tool_use block
-                                content_block = {
-                                    'type': 'content_block_start', 
-                                    'index': anthropic_tool_index, 
+                                content_blocks[tool_index] = {
+                                    "type": "tool_use",
+                                    "id": tool_id,
+                                    "name": name,
+                                    "input": {}
+                                }
+                                
+                                content_block_data = {
+                                    'type': 'content_block_start',
+                                    'index': tool_index,
                                     'content_block': {
-                                        'type': 'tool_use', 
-                                        'id': tool_id, 
-                                        'name': name, 
+                                        'type': 'tool_use',
+                                        'id': tool_id,
+                                        'name': name,
                                         'input': {}
                                     }
                                 }
-                                yield f"event: content_block_start\ndata: {json.dumps(content_block)}\n\n"
-                                current_tool_call = tool_call
-                                tool_content = ""
-                            
-                            # Extract function arguments
-                            arguments = None
-                            if isinstance(tool_call, dict) and 'function' in tool_call:
-                                function = tool_call.get('function', {})
-                                arguments = function.get('arguments', '') if isinstance(function, dict) else ''
-                            elif hasattr(tool_call, 'function'):
-                                function = getattr(tool_call, 'function', None)
-                                arguments = getattr(function, 'arguments', '') if function else ''
-                            
-                            # If we have arguments, send them as a delta
-                            if arguments:
-                                # Try to detect if arguments are valid JSON or just a fragment
+                                yield f"event: content_block_start\ndata: {json.dumps(content_block_data)}\n\n"
+                                
+                                # Add the tool arguments
+                                arguments_str = function.get('arguments', '{}')
                                 try:
-                                    # If it's already a dict, use it
-                                    if isinstance(arguments, dict):
-                                        args_json = json.dumps(arguments)
-                                    else:
-                                        # Otherwise, try to parse it
-                                        json.loads(arguments)
-                                        args_json = arguments
-                                except (json.JSONDecodeError, TypeError):
-                                    # If it's a fragment, treat it as a string
-                                    args_json = arguments
-                                
-                                # Add to accumulated tool content
-                                tool_content += args_json if isinstance(args_json, str) else ""
-                                
-                                # Send the update
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anthropic_tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_json}})}\n\n"
-                    
-                    # Process finish_reason - end the streaming response
-                    if finish_reason and not has_sent_stop_reason:
-                        has_sent_stop_reason = True
-                        
-                        # Close any open tool call blocks
-                        if tool_index is not None:
-                            for i in range(1, last_tool_index + 1):
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
-                        
-                        # If we accumulated text but never sent or closed text block, do it now
-                        if not text_block_closed:
-                            if accumulated_text and not text_sent:
-                                # Send the accumulated text
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
-                            # Close the text block
-                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                        
-                        # Map OpenAI finish_reason to Anthropic stop_reason
-                        stop_reason = "end_turn"
-                        if finish_reason == "length":
-                            stop_reason = "max_tokens"
-                        elif finish_reason == "tool_calls":
+                                    arguments = json.loads(arguments_str)
+                                    content_blocks[tool_index]["input"] = arguments
+                                    
+                                    # Send input delta
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': tool_index, 'delta': {'type': 'tool_use_delta', 'input': arguments}})}\n\n"
+                                    
+                                    # Close the tool_use block
+                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
+                                except json.JSONDecodeError:
+                                    # Send as string if not valid JSON
+                                    content_blocks[tool_index]["input"] = {"raw": arguments_str}
+                                    
+                                    # Send input delta
+                                    raw_arg_object = {'raw': arguments_str}
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': tool_index, 'delta': {'type': 'tool_use_delta', 'input': raw_arg_object}})}\n\n"
+                                    
+                                    # Close the tool_use block
+                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
+                            
+                            # Set stop reason to tool_use since we detected tool calls
                             stop_reason = "tool_use"
-                        elif finish_reason == "stop":
-                            stop_reason = "end_turn"
+                            
+                            # Send message_delta with stop reason
+                            usage = {"output_tokens": output_tokens}
+                            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': usage})}\n\n"
+                            
+                            # Set flag to avoid duplicate stop messages
+                            has_sent_stop_reason = True
+                            
+                            # Send message_stop event
+                            message_stop_json = json.dumps({'type': 'message_stop'})
+                            yield f"event: message_stop\ndata: {message_stop_json}\n\n"
+                            
+                            # Send final [DONE] marker
+                            yield "data: [DONE]\n\n"
+                            return
+            
+            # Process tool calls from OpenAI API directly
+            if tool_calls:
+                for tool_call in tool_calls:
+                    # Only process if there's a function
+                    if not hasattr(tool_call, 'function'):
+                        continue
+                    
+                    # Determine tool index (starting at 1 as 0 is reserved for text)
+                    if not hasattr(tool_call, 'index'):
+                        # If no index, increment based on our own last seen
+                        last_tool_index += 1
+                        current_tool_index = last_tool_index
+                    else:
+                        # Use the provided index + 1 (since 0 is text)
+                        current_tool_index = tool_call.index + 1
+                        last_tool_index = max(last_tool_index, current_tool_index)
+                    
+                    # Initialize the tool block if not present
+                    if current_tool_index not in content_blocks:
+                        tool_name = ""
+                        if hasattr(tool_call.function, 'name'):
+                            tool_name = tool_call.function.name
                         
-                        # Send message_delta with stop reason and usage
-                        usage = {"output_tokens": output_tokens}
+                        # Generate a unique ID for this tool call
+                        tool_id = f"call_{uuid.uuid4().hex[:8]}"
                         
-                        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n"
+                        # Start a new tool use block
+                        content_blocks[current_tool_index] = {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": tool_name,
+                            "input": {}
+                        }
                         
-                        # Send message_stop event
-                        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+                        # Send tool block start event
+                        content_block_data = {
+                            'type': 'content_block_start',
+                            'index': current_tool_index,
+                            'content_block': {
+                                'type': 'tool_use',
+                                'id': tool_id,
+                                'name': tool_name,
+                                'input': {}
+                            }
+                        }
+                        yield f"event: content_block_start\ndata: {json.dumps(content_block_data)}\n\n"
+                    
+                    # Update tool name if provided
+                    if hasattr(tool_call.function, 'name') and tool_call.function.name:
+                        content_blocks[current_tool_index]["name"] = tool_call.function.name
                         
-                        # Send final [DONE] marker to match Anthropic's behavior
-                        yield "data: [DONE]\n\n"
-                        return
-            except Exception as e:
-                # Log error but continue processing other chunks
-                logger.error(f"Error processing chunk: {str(e)}")
-                continue
-        
-        # If we didn't get a finish reason, close any open blocks
-        if not has_sent_stop_reason:
-            # Close any open tool call blocks
-            if tool_index is not None:
-                for i in range(1, last_tool_index + 1):
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
+                        # Send name update if changed
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': current_tool_index, 'delta': {'type': 'tool_use_delta', 'name': tool_call.function.name}})}\n\n"
+                    
+                    # Update tool arguments if provided
+                    if hasattr(tool_call.function, 'arguments') and tool_call.function.arguments:
+                        try:
+                            # Parse the JSON arguments
+                            args_json = json.loads(tool_call.function.arguments)
+                            
+                            # Update the input field in the block
+                            content_blocks[current_tool_index]["input"] = args_json
+                            
+                            # Send input delta
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': current_tool_index, 'delta': {'type': 'tool_use_delta', 'input': args_json}})}\n\n"
+                        except Exception as e:
+                            # If we can't parse it as JSON, just use the string
+                            content_blocks[current_tool_index]["input"] = tool_call.function.arguments
+                            
+                            # Send input delta
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': current_tool_index, 'delta': {'type': 'tool_use_delta', 'input': tool_call.function.arguments}})}\n\n"
             
-            # Close the text content block
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-            
-            # Send final message_delta with usage
-            usage = {"output_tokens": output_tokens}
-            
-            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': usage})}\n\n"
-            
-            # Send message_stop event
-            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-            
-            # Send final [DONE] marker to match Anthropic's behavior
-            yield "data: [DONE]\n\n"
+            # Check if this is the final chunk
+            if hasattr(chunk.choices[0], 'finish_reason') and chunk.choices[0].finish_reason and not has_sent_stop_reason:
+                # Close any open content blocks
+                if tool_index is not None:
+                    # Close all tool blocks first
+                    for i in range(1, last_tool_index + 1):
+                        if i in content_blocks and not text_block_closed:
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
+                    
+                    # Close the text content block if it wasn't closed before
+                    if 0 in content_blocks and not text_block_closed:
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                
+                # Set flag to avoid duplicate stop messages
+                has_sent_stop_reason = True
+                
+                # Map OpenAI finish reason to Anthropic stop reason
+                finish_reason = chunk.choices[0].finish_reason
+                if finish_reason == "length":
+                    stop_reason = "max_tokens"
+                elif finish_reason == "tool_calls":
+                    stop_reason = "tool_use"
+                elif finish_reason == "stop":
+                    stop_reason = "end_turn"
+                else:
+                    stop_reason = "end_turn"  # Default
+                
+                # Send message_delta with stop reason and usage
+                usage = {"output_tokens": output_tokens}
+                
+                yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n"
+                
+                # Send message_stop event
+                message_stop_json = json.dumps({'type': 'message_stop'})
+                yield f"event: message_stop\ndata: {message_stop_json}\n\n"
+                
+                # Send final [DONE] marker to match Anthropic's behavior
+                yield "data: [DONE]\n\n"
+                return
     
+    except asyncio.CancelledError:
+        # Handle client disconnection
+        logger.info("Stream was cancelled (client disconnected)")
+        # No need to yield anything more after the client disconnects
+        return
+
+    except GeneratorExit:
+        # Handle generator exit explicitly (client disconnected)
+        logger.info("Generator exited (client disconnected)")
+        return
+        
     except Exception as e:
+        # Log error
+        logger.error(f"Error processing chunk: {str(e)}")
         import traceback
         error_traceback = traceback.format_exc()
         error_message = f"Error in streaming: {str(e)}\n\nFull traceback:\n{error_traceback}"
         logger.error(error_message)
         
-        # Send error message_delta
-        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
+        try:
+            # Send error message_delta
+            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
+            
+            # Send message_stop event
+            message_stop_json = json.dumps({'type': 'message_stop'})
+            yield f"event: message_stop\ndata: {message_stop_json}\n\n"
+            
+            # Send final [DONE] marker
+            yield "data: [DONE]\n\n"
+        except:
+            # If we can't send the error response, just log it and return
+            logger.error("Failed to send error response after exception")
+            return
+    
+    finally:
+        # Only try to yield final messages if we haven't sent a stop reason yet
+        # and the generator hasn't been closed
+        try:
+            if not has_sent_stop_reason:
+                # Try a zero-length yield to check if client is still connected
+                try:
+                    # This will raise GeneratorExit if client disconnected
+                    yield ""
+                    
+                    # Continue with cleanup since client is still connected
+                    # Close any open tool call blocks
+                    if tool_index is not None:
+                        for i in range(1, last_tool_index + 1):
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
+                    
+                    # Close the text content block
+                    if 0 in content_blocks and not text_block_closed:
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                    
+                    # Send final message_delta with usage
+                    usage = {"output_tokens": output_tokens}
+                    
+                    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': usage})}\n\n"
+                    
+                    # Send message_stop event
+                    message_stop_json = json.dumps({'type': 'message_stop'})
+                    yield f"event: message_stop\ndata: {message_stop_json}\n\n"
+                    
+                    # Send final [DONE] marker to match Anthropic's behavior
+                    yield "data: [DONE]\n\n"
+                    logger.info("Stream complete with normal termination in finally block")
+                except GeneratorExit:
+                    # Client already disconnected during our test yield
+                    logger.info("Client disconnected during finally block cleanup")
+                    # Re-raise to properly close the generator
+                    raise
+        except GeneratorExit:
+            # Generator was exited during the finally block, which is fine
+            logger.info("Generator exited during cleanup in finally block")
+            # Re-raise to properly close the generator
+            raise
+        except Exception as e:
+            # Log any errors in the finally block but don't re-raise
+            logger.error(f"Error during stream cleanup: {str(e)}")
+            pass
+
+def mask_api_key(api_key):
+    """Mask an API key for displaying in logs."""
+    if not api_key:
+        return "Not set"
+    if len(api_key) <= 8:
+        return "***" + api_key[-2:]
+    return api_key[:4] + "..." + api_key[-4:]
+
+
+def convert_message_to_openai(message):
+    """Convert an Anthropic message to OpenAI format."""
+    if not message:
+        return {"role": "user", "content": ""}
+    
+    role = message.role
+    content = ""
+    
+    # Handle content blocks
+    if message.content and isinstance(message.content, list):
+        for block in message.content:
+            if block.type == "text":
+                content += block.text
+            # Handle other block types if needed
+    
+    # Return the converted message
+    return {
+        "role": role,
+        "content": content
+    }
+
+
+async def handle_openai_streaming(openai_stream, request):
+    """
+    Handle streaming responses from OpenAI API.
+    Handles the streaming format from OpenAI v1 client for Together.ai
+    """
+    message_id = f"msg_{uuid.uuid4()}"
+    first_token_received = False
+    content_block_index = 0
+    current_content = "" # Holds content for the current text block (index 0)
+    current_tool_calls = {} # Stores aggregated tool call info by *tool_index*
+    stream_completed_successfully = False
+    active_block_type = None # Track if the currently open block is 'text' or 'tool'
+    
+    # Special tracking for Together.ai tool detection from text
+    is_together_model = request.model.startswith("together_ai/")
+    has_tools = request.tools and len(request.tools) > 0
+    accumulated_text = "" if (is_together_model and has_tools) else None
+    detected_tool_calls = []
+    text_block_closed = False
+
+    try:
+        # The OpenAI v1 client returns an iterator
+        for chunk in openai_stream:
+            if log_level <= logging.DEBUG or RICH_DEBUG:
+                try:
+                    chunk_json = chunk.model_dump_json(indent=2)
+                    debug_console.print(f"[dim]Received chunk: {chunk_json}[/dim]")
+                except Exception as json_err:
+                    debug_console.print(f"[dim]Received chunk (non-JSON serializable?): {chunk} / Error: {json_err}[/dim]")
+
+            # Process choices in the chunk
+            if hasattr(chunk, "choices") and chunk.choices:
+                choice = chunk.choices[0]
+                
+                if hasattr(choice, "delta") and choice.delta:
+                    delta = choice.delta
+                    
+                    # --- Start Message --- 
+                    if not first_token_received:
+                        first_token_received = True
+                        yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'model': request.model}})}\n\n"
+                    
+                    # --- Handle Text Delta --- 
+                    if hasattr(delta, "content") and delta.content is not None:
+                        # If this is the first text piece and no block is active, start text block
+                        if active_block_type is None:
+                            active_block_type = 'text'
+                            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': content_block_index, 'content_block': {'type': 'text'}})}\n\n"
+                        
+                        # Ensure we are in a text block before adding content
+                        if active_block_type == 'text':
+                            current_content += delta.content
+                            
+                            # Accumulate text for Together.ai tool detection
+                            if is_together_model and has_tools:
+                                accumulated_text += delta.content
+                                
+                                # Check for complete tool call patterns in accumulated text
+                                complete_json_block = re.search(r"```(?:json)?\s*\n(\{.*?\})\s*\n```", accumulated_text, re.DOTALL)
+                                complete_function_call = re.search(r"USE_TOOL:\s*(\w+)\s*PARAMETERS:\s*(\{.*?\})", accumulated_text, re.DOTALL)
+                                
+                                if (complete_json_block or complete_function_call) and not detected_tool_calls:
+                                    # Attempt to detect tool calls
+                                    tool_calls_found = detect_tool_calls_in_text(accumulated_text)
+                                    
+                                    if tool_calls_found:
+                                        # Found tool calls in the text output
+                                        detected_tool_calls = tool_calls_found
+                                        
+                                        # Close the current text block
+                                        text_block_closed = True
+                                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n"
+                                        
+                                        # Create cleaned text without tool calls
+                                        cleaned_text = accumulated_text
+                                        cleaned_text = re.sub(r"```(?:json)?\s*\n.*?\n```", "[Tool Call Removed]", cleaned_text, flags=re.DOTALL)
+                                        cleaned_text = re.sub(r"USE_TOOL:\s*\w+\s*PARAMETERS:\s*\{.*?\}", "[Tool Call Removed]", cleaned_text, flags=re.DOTALL)
+                                        cleaned_text = re.sub(r"use the \w+ tool with parameters:?\s*\{.*?\}", "[Tool Call Removed]", cleaned_text, flags=re.IGNORECASE | re.DOTALL)
+                                        
+                                        # Update current_content with cleaned text
+                                        current_content = cleaned_text.strip()
+                                        
+                                        # Process each detected tool call
+                                        for i, tool_call in enumerate(detected_tool_calls):
+                                            tool_index = i + 1  # Start at 1 since 0 is text
+                                            
+                                            # Extract tool info
+                                            function = tool_call.get('function', {})
+                                            name = function.get('name', '')
+                                            tool_id = tool_call.get('id', f"tool_{uuid.uuid4().hex[:8]}")
+                                            arguments_str = function.get('arguments', '{}')
+                                            
+                                            try:
+                                                arguments = json.loads(arguments_str)
+                                            except json.JSONDecodeError:
+                                                arguments = {"raw": arguments_str}
+                                            
+                                            # Start a new tool_use block
+                                            content_block_data = {
+                                                'type': 'content_block_start',
+                                                'index': tool_index,
+                                                'content_block': {
+                                                    'type': 'tool_use',
+                                                    'id': tool_id,
+                                                    'name': name,
+                                                    'input': {}
+                                                }
+                                            }
+                                            yield f"event: content_block_start\ndata: {json.dumps(content_block_data)}\n\n"
+                                            
+                                            # Send the tool input delta
+                                            tool_delta = {
+                                                'type': 'content_block_delta',
+                                                'index': tool_index, 
+                                                'delta': {
+                                                    'type': 'tool_use_delta',
+                                                    'input': arguments
+                                                }
+                                            }
+                                            yield f"event: content_block_delta\ndata: {json.dumps(tool_delta)}\n\n"
+                                            
+                                            # Close the tool_use block
+                                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
+                                        
+                                        # Set finish indicator
+                                        stream_completed_successfully = True
+                                        
+                                        # Send final events
+                                        message_delta_json = json.dumps({
+                                            'type': 'message_delta',
+                                            'delta': {'stop_reason': 'tool_use'},
+                                            'usage': {'output_tokens': len(accumulated_text) // 4}  # Rough estimate
+                                        })
+                                        yield f"event: message_delta\ndata: {message_delta_json}\n\n"
+                                        
+                                        # Send message_stop event
+                                        message_stop_json = json.dumps({'type': 'message_stop'})
+                                        yield f"event: message_stop\ndata: {message_stop_json}\n\n"
+                                        
+                                        # Send final [DONE] marker
+                                        yield "data: [DONE]\n\n"
+                                        return
+                            
+                            # Send regular content delta if no tool calls detected and we're in a text block
+                            if not text_block_closed and active_block_type == 'text':
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': delta.content}, 'index': content_block_index})}\n\n"
+                            # Don't log warning about text in tool block - this is normal in some models
+                            # and just creates log spam while not being actionable
+                    
+                    # --- Handle Tool Call Delta from native OpenAI format --- 
+                    if hasattr(delta, "tool_calls") and delta.tool_calls:
+                        for tool_call_chunk in delta.tool_calls:
+                            tool_index = tool_call_chunk.index # This is the index within the tool_calls list
+                            if tool_index is None: continue # Skip if no index
+                            
+                            # Calculate the Anthropic content_block index for this tool
+                            # It's 1 + tool_index if a text block exists, otherwise tool_index
+                            anthropic_tool_block_index = tool_index + (1 if current_content or active_block_type == 'text' else 0)
+
+                            # Start of a new tool call instance
+                            if tool_call_chunk.id and tool_call_chunk.type == 'function':
+                                # Close the text block if it was active
+                                if active_block_type == 'text':
+                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n"
+                                    active_block_type = 'tool' # Switch active block type
+                                    content_block_index = anthropic_tool_block_index # Update the main index counter
+                                elif active_block_type is None:
+                                    active_block_type = 'tool'
+                                    content_block_index = anthropic_tool_block_index
+                                
+                                # Initialize storage for this tool call
+                                if tool_index not in current_tool_calls:
+                                    current_tool_calls[tool_index] = {
+                                        "id": tool_call_chunk.id,
+                                        "name": getattr(tool_call_chunk.function, 'name', ""), # Get initial name if available
+                                        "input": getattr(tool_call_chunk.function, 'arguments', "") # Get initial args if available
+                                    }
+                                    # Send content_block_start for the tool
+                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anthropic_tool_block_index, 'content_block': {'type': 'tool_use', 'id': tool_call_chunk.id, 'name': current_tool_calls[tool_index]['name'], 'input': {}}})}\n\n"
+                                else:
+                                     # This case might indicate receiving the ID again for an existing index? Log a warning.
+                                     logger.warning(f"Received tool start chunk again for tool_index {tool_index}")
+
+                            # Delta for an existing tool call (name or arguments)
+                            if tool_call_chunk.function and tool_index in current_tool_calls:
+                                delta_payload = {"type": "tool_use_delta"}
+                                updated = False
+                                if hasattr(tool_call_chunk.function, 'name') and tool_call_chunk.function.name:
+                                    current_tool_calls[tool_index]["name"] = tool_call_chunk.function.name
+                                    delta_payload["name"] = tool_call_chunk.function.name
+                                    updated = True
+                                if hasattr(tool_call_chunk.function, 'arguments') and tool_call_chunk.function.arguments:
+                                    current_tool_calls[tool_index]["input"] += tool_call_chunk.function.arguments
+                                    delta_payload["input"] = tool_call_chunk.function.arguments # Send only the delta part
+                                    updated = True
+                                
+                                if updated:
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anthropic_tool_block_index, 'delta': delta_payload})}\n\n"
+                                        
+                # --- End of Message / Stop Reason --- 
+                if hasattr(choice, "finish_reason") and choice.finish_reason is not None and not stream_completed_successfully:
+                    stream_completed_successfully = True
+                    stop_reason = "end_turn"
+                    if choice.finish_reason == "length": stop_reason = "max_tokens"
+                    elif choice.finish_reason == "tool_calls": stop_reason = "tool_use"
+                        
+                    # Close the last active content block (text or tool)
+                    if active_block_type == 'text':
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n"
+                    elif active_block_type == 'tool':
+                        # Calculate the index of the last tool block that was started
+                        last_tool_anthropic_index = len(current_tool_calls) -1 + (1 if any(t['id'] for t in current_tool_calls.values()) and current_content == "" else 0) # Complicated... relies on text block presence
+                        last_tool_anthropic_index = max(0, last_tool_anthropic_index) # Ensure non-negative index
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': last_tool_anthropic_index})}\n\n"
+                        
+                    # Log any parsing errors for the final tool inputs (don't send in stream)
+                    for idx, tool_info in current_tool_calls.items():
+                        if isinstance(tool_info["input"], str):
+                            try: json.loads(tool_info["input"])
+                            except json.JSONDecodeError as json_err:
+                                logger.warning(f"Final tool input JSON invalid for tool {tool_info.get('name', '?')} (id: {tool_info.get('id', '?')}): {json_err}")
+
+                    # Send final message events
+                    message_delta_json = json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}})
+                    yield f"event: message_delta\ndata: {message_delta_json}\n\n"
+                    
+                    message_stop_json = json.dumps({'type': 'message_stop'})
+                    yield f"event: message_stop\ndata: {message_stop_json}\n\n"
+                    
+                    yield f"data: [DONE]\n\n"
+                    return # Clean exit from generator
+    
+    except asyncio.CancelledError:
+        # Handle client disconnection properly
+        logger.info("Stream was cancelled (client disconnected)")
+        return
         
-        # Send message_stop event
-        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    except GeneratorExit:
+        # Handle generator exit explicitly - immediately terminate without any further yields
+        logger.info("Generator exited (client disconnected)")
+        # Must exit cleanly and immediately without any further operations
+        # DO NOT call any other yield operations after receiving GeneratorExit
+        return
+
+    except Exception as e:
+        import traceback
+        error_message = f"Error during Together.ai stream processing: {str(e)}\n{traceback.format_exc()}"
+        logger.error(error_message)
+        try:
+            error_payload = json.dumps({
+                'type': 'error',
+                'error': {'type': 'internal_server_error', 'message': error_message}
+            })
+            yield f"event: error\ndata: {error_payload}\n\n"
+        except Exception as yield_err: 
+            logger.error(f"Failed to yield error event: {yield_err}")
+            return
+
+    finally:
+        # For cleanup operations that don't involve yielding
+        # The key is to NOT yield anything if stream_completed_successfully is False,
+        # as we might be in the middle of handling a GeneratorExit
         
-        # Send final [DONE] marker
-        yield "data: [DONE]\n\n"
+        # We can log information, but must not yield after GeneratorExit
+        if not stream_completed_successfully:
+            logger.info("Stream terminated without completion")
+        
+        # Any cleanup that doesn't involve yield operations can go here
+        # DO NOT attempt to yield in a finally block after GeneratorExit
+        # This avoids the "async generator ignored GeneratorExit" exception
 
 @app.post("/v1/messages")
 async def create_message(
     request: MessagesRequest,
-    raw_request: Request
+    raw_request: Request,
+    background_tasks: BackgroundTasks,
+    response: Response,
 ):
+    """
+    Create a message (i.e., perform inference).
+    """
     try:
-        # print the body here
+        # print the body here for debugging
         body = await raw_request.body()
     
         # Parse the raw body as JSON since it's bytes
@@ -1385,6 +1928,129 @@ async def create_message(
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
         
+        # Special case: If using Together.ai model, use the OpenAI client directly
+        if request.model.startswith("together_ai/"):
+            # Extract model name (already done in convert_anthropic_to_litellm)
+            model_name = litellm_request["model"]
+            
+            # Initialize OpenAI client
+            client = openai.OpenAI(
+                api_key=TOGETHERAI_API_KEY,
+                base_url="https://api.together.xyz/v1",
+            )
+            
+            # Log request information
+            logger.info(f"Using direct OpenAI client for Together.ai model: {model_name}")
+            
+            # Create request parameters - convert from LiteLLM format to OpenAI params
+            openai_params = {
+                "model": model_name,
+                "messages": litellm_request["messages"],
+                "stream": request.stream,
+            }
+            
+            # Add optional parameters
+            if "max_tokens" in litellm_request:
+                openai_params["max_tokens"] = litellm_request["max_tokens"]
+            if "temperature" in litellm_request:
+                openai_params["temperature"] = litellm_request["temperature"]
+            if "top_p" in litellm_request:
+                openai_params["top_p"] = litellm_request["top_p"]
+            if "stop" in litellm_request:
+                openai_params["stop"] = litellm_request["stop"]
+                
+            # Add tools if they exist
+            if "tools" in litellm_request:
+                openai_params["tools"] = litellm_request["tools"]
+                
+            # Add tool_choice if it exists
+            if "tool_choice" in litellm_request:
+                openai_params["tool_choice"] = litellm_request["tool_choice"]
+            
+            # Debug log the request
+            if log_level <= logging.DEBUG or RICH_DEBUG:
+                debug_message = f"Together.ai request with {len(openai_params['messages'])} messages"
+                if 'tools' in openai_params:
+                    debug_message += f" and {len(openai_params['tools'])} tools"
+                debug_console.print(Panel(
+                    debug_message,
+                    title="[bold]Together.ai Direct API Call[/bold]",
+                    border_style="green"
+                ))
+            
+            try:
+                # Make API call based on streaming preference
+                if request.stream:
+                    # Streaming call
+                    stream = client.chat.completions.create(**openai_params)
+                    
+                    # Return streaming response
+                    return StreamingResponse(
+                        handle_openai_streaming(stream, request),
+                        media_type="text/event-stream"
+                    )
+                else:
+                    # Non-streaming call
+                    start_time = time.time()
+                    completion = client.chat.completions.create(**openai_params)
+                    response_time = time.time() - start_time
+                    
+                    logger.info(f"Together.ai response received in {response_time:.2f}s")
+                    
+                    # Convert to Anthropic format
+                    content = []
+                    
+                    # Extract text content
+                    message_content = completion.choices[0].message.content
+                    if message_content:
+                        content.append({"type": "text", "text": message_content})
+                    
+                    # Extract tool calls if present
+                    tool_calls = completion.choices[0].message.tool_calls
+                    if tool_calls:
+                        logger.info(f"Tool calls received from Together.ai: {len(tool_calls)}")
+                        
+                        for tool_call in tool_calls:
+                            # Extract function data
+                            function = tool_call.function
+                            tool_use = {
+                                "type": "tool_use",
+                                "id": tool_call.id,
+                                "name": function.name,
+                                "input": json.loads(function.arguments)
+                            }
+                            content.append(tool_use)
+                    
+                    # Map finish reason to stop reason
+                    stop_reason = "end_turn"
+                    finish_reason = completion.choices[0].finish_reason
+                    if finish_reason == "length":
+                        stop_reason = "max_tokens"
+                    elif finish_reason == "tool_calls":
+                        stop_reason = "tool_use"
+                    
+                    # Create Anthropic-style response
+                    anthropic_response = MessagesResponse(
+                        id=completion.id,
+                        model=request.model,  # Use original model name with prefix
+                        role="assistant",
+                        content=content,
+                        stop_reason=stop_reason,
+                        stop_sequence=None,
+                        usage=Usage(
+                            input_tokens=completion.usage.prompt_tokens,
+                            output_tokens=completion.usage.completion_tokens
+                        )
+                    )
+                    
+                    return anthropic_response
+                    
+            except Exception as e:
+                # Log the error
+                logger.error(f"Error calling Together.ai API: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Together.ai API error: {str(e)}")
+        
+        # Normal flow for other models using LiteLLM
         # Determine which API key to use based on the model
         if request.model.startswith("openai/"):
             litellm_request["api_key"] = OPENAI_API_KEY
@@ -1392,268 +2058,11 @@ async def create_message(
         elif request.model.startswith("gemini/"):
             litellm_request["api_key"] = GEMINI_API_KEY
             logger.debug(f"Using Gemini API key for model: {request.model}")
-        elif request.model.startswith("together_ai/"):
-            litellm_request["api_key"] = TOGETHERAI_API_KEY
-            # Explicitly set custom_llm_provider to "together_ai" (with underscore)
-            # This ensures consistency with LiteLLM's expected provider name
-            litellm_request["custom_llm_provider"] = "together_ai"
-            # Set the base_url for Together.ai API
-            litellm_request["base_url"] = "https://api.together.xyz/v1"
-            # Extract the model name without the provider prefix
-            model_name = request.model[len("together_ai/"):]
-            # Update the model name format for Together.ai
-            litellm_request["model"] = model_name
-            
-            # Rich debug information for Together.ai requests
-            if log_level <= logging.DEBUG or RICH_DEBUG:
-                provider_name = "Together.ai"
-                debug_table = Table(title=f"{provider_name} Request Details", show_header=True, header_style="bold magenta")
-                debug_table.add_column("Parameter", style="dim")
-                debug_table.add_column("Value")
-                
-                debug_table.add_row("Model", f"[cyan]{model_name}[/cyan]")
-                debug_table.add_row("Base URL", litellm_request["base_url"])
-                debug_table.add_row("Custom Provider", litellm_request["custom_llm_provider"])
-                debug_table.add_row("API Key (masked)", f"{TOGETHERAI_API_KEY[:5]}...{TOGETHERAI_API_KEY[-5:]}" if TOGETHERAI_API_KEY else "Not set")
-                
-                if "tools" in litellm_request:
-                    debug_table.add_row("Tools", "[yellow]Present but will be removed[/yellow]")
-                else:
-                    debug_table.add_row("Tools", "None")
-                
-                debug_console.print(Panel(debug_table, title=f"[bold green]{provider_name} Debug Info[/bold green]", 
-                                  subtitle="[dim]Tools are not supported and will be processed as text[/dim]"))
-                
-                # Also debug the first message content
-                if "messages" in litellm_request and litellm_request["messages"]:
-                    first_msg = litellm_request["messages"][0]
-                    content_preview = str(first_msg.get("content", ""))[:150] + "..." if len(str(first_msg.get("content", ""))) > 150 else str(first_msg.get("content", ""))
-                    debug_console.print(f"[bold blue]First Message[/bold blue]: role={first_msg.get('role', 'unknown')}, content={content_preview}")
-            
-            logger.debug(f"Using {provider_name} API key for model: {model_name}")
         else:
             litellm_request["api_key"] = ANTHROPIC_API_KEY
             logger.debug(f"Using Anthropic API key for model: {request.model}")
         
-        # For OpenAI models - modify request format to work with limitations
-        if "openai" in litellm_request["model"] and "messages" in litellm_request:
-            logger.debug(f"Processing OpenAI model request: {litellm_request['model']}")
-            
-            # For OpenAI models, we need to convert content blocks to simple strings
-            # and handle other requirements
-            for i, msg in enumerate(litellm_request["messages"]):
-                # Special case - handle message content directly when it's a list of tool_result
-                # This is a specific case we're seeing in the error
-                if "content" in msg and isinstance(msg["content"], list):
-                    is_only_tool_result = True
-                    for block in msg["content"]:
-                        if not isinstance(block, dict) or block.get("type") != "tool_result":
-                            is_only_tool_result = False
-                            break
-                    
-                    if is_only_tool_result and len(msg["content"]) > 0:
-                        logger.warning(f"Found message with only tool_result content - special handling required")
-                        # Extract the content from all tool_result blocks
-                        all_text = ""
-                        for block in msg["content"]:
-                            all_text += "Tool Result:\n"
-                            result_content = block.get("content", [])
-                            
-                            # Handle different formats of content
-                            if isinstance(result_content, list):
-                                for item in result_content:
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        all_text += item.get("text", "") + "\n"
-                                    elif isinstance(item, dict):
-                                        # Fall back to string representation of any dict
-                                        try:
-                                            item_text = item.get("text", json.dumps(item))
-                                            all_text += item_text + "\n"
-                                        except:
-                                            all_text += str(item) + "\n"
-                            elif isinstance(result_content, str):
-                                all_text += result_content + "\n"
-                            else:
-                                try:
-                                    all_text += json.dumps(result_content) + "\n"
-                                except:
-                                    all_text += str(result_content) + "\n"
-                        
-                        # Replace the list with extracted text
-                        litellm_request["messages"][i]["content"] = all_text.strip() or "..."
-                        logger.warning(f"Converted tool_result to plain text: {all_text.strip()[:200]}...")
-                        continue  # Skip normal processing for this message
-                
-                # 1. Handle content field - normal case
-                if "content" in msg:
-                    # Check if content is a list (content blocks)
-                    if isinstance(msg["content"], list):
-                        # Convert complex content blocks to simple string
-                        text_content = ""
-                        for block in msg["content"]:
-                            if isinstance(block, dict):
-                                # Handle different content block types
-                                if block.get("type") == "text":
-                                    text_content += block.get("text", "") + "\n"
-                                
-                                # Handle tool_result content blocks - extract nested text
-                                elif block.get("type") == "tool_result":
-                                    tool_id = block.get("tool_use_id", "unknown")
-                                    text_content += f"[Tool Result ID: {tool_id}]\n"
-                                    
-                                    # Extract text from the tool_result content
-                                    result_content = block.get("content", [])
-                                    if isinstance(result_content, list):
-                                        for item in result_content:
-                                            if isinstance(item, dict) and item.get("type") == "text":
-                                                text_content += item.get("text", "") + "\n"
-                                            elif isinstance(item, dict):
-                                                # Handle any dict by trying to extract text or convert to JSON
-                                                if "text" in item:
-                                                    text_content += item.get("text", "") + "\n"
-                                                else:
-                                                    try:
-                                                        text_content += json.dumps(item) + "\n"
-                                                    except:
-                                                        text_content += str(item) + "\n"
-                                    elif isinstance(result_content, dict):
-                                        # Handle dictionary content
-                                        if result_content.get("type") == "text":
-                                            text_content += result_content.get("text", "") + "\n"
-                                        else:
-                                            try:
-                                                text_content += json.dumps(result_content) + "\n"
-                                            except:
-                                                text_content += str(result_content) + "\n"
-                                    elif isinstance(result_content, str):
-                                        text_content += result_content + "\n"
-                                    else:
-                                        try:
-                                            text_content += json.dumps(result_content) + "\n"
-                                        except:
-                                            text_content += str(result_content) + "\n"
-                                
-                                # Handle tool_use content blocks
-                                elif block.get("type") == "tool_use":
-                                    tool_name = block.get("name", "unknown")
-                                    tool_id = block.get("id", "unknown")
-                                    tool_input = json.dumps(block.get("input", {}))
-                                    text_content += f"[Tool: {tool_name} (ID: {tool_id})]\nInput: {tool_input}\n\n"
-                                
-                                # Handle image content blocks
-                                elif block.get("type") == "image":
-                                    text_content += "[Image content - not displayed in text format]\n"
-                        
-                        # Make sure content is never empty for OpenAI models
-                        if not text_content.strip():
-                            text_content = "..."
-                        
-                        litellm_request["messages"][i]["content"] = text_content.strip()
-                    # Also check for None or empty string content
-                    elif msg["content"] is None:
-                        litellm_request["messages"][i]["content"] = "..." # Empty content not allowed
-                
-                # 2. Remove any fields OpenAI doesn't support in messages
-                for key in list(msg.keys()):
-                    if key not in ["role", "content", "name", "tool_call_id", "tool_calls"]:
-                        logger.warning(f"Removing unsupported field from message: {key}")
-                        del msg[key]
-            
-            # 3. Final validation - check for any remaining invalid values and dump full message details
-            for i, msg in enumerate(litellm_request["messages"]):
-                # Log the message format for debugging
-                logger.debug(f"Message {i} format check - role: {msg.get('role')}, content type: {type(msg.get('content'))}")
-                
-                # If content is still a list or None, replace with placeholder
-                if isinstance(msg.get("content"), list):
-                    logger.warning(f"CRITICAL: Message {i} still has list content after processing: {json.dumps(msg.get('content'))}")
-                    # Last resort - stringify the entire content as JSON
-                    litellm_request["messages"][i]["content"] = f"Content as JSON: {json.dumps(msg.get('content'))}"
-                elif msg.get("content") is None:
-                    logger.warning(f"Message {i} has None content - replacing with placeholder")
-                    litellm_request["messages"][i]["content"] = "..." # Fallback placeholder
-        
-        # Log request information based on logging settings
-        if log_level == logging.DEBUG or SHOW_MODEL_DETAILS:
-            # Create a summary of the request
-            requested_model = request.model
-            actual_model = litellm_request.get('model')
-            is_streaming = litellm_request.get('stream', False)
-            msg_count = len(litellm_request.get('messages', []))
-            max_tokens_val = litellm_request.get('max_completion_tokens', litellm_request.get('max_tokens', 'unknown'))
-            
-            # Show a focused summary
-            request_summary = f"📤 REQUEST: From='{requested_model}' To='{actual_model}', Stream={is_streaming}, MaxTokens={max_tokens_val}, Messages={msg_count}"
-            
-            if SHOW_MODEL_DETAILS:
-                # If we're showing model details, log at INFO level
-                logger.info(request_summary)
-                
-                # Optionally show a preview of the last message
-                if msg_count > 0 and "messages" in litellm_request:
-                    last_msg = litellm_request["messages"][-1]
-                    role = last_msg.get("role", "unknown")
-                    content = last_msg.get("content", "")
-                    if isinstance(content, str):
-                        preview = content[:100] + ("..." if len(content) > 100 else "")
-                        logger.info(f"Last message ({role}): {preview}")
-            
-            # In full debug mode, log the detailed request
-            if log_level == logging.DEBUG:
-                # Create a safe copy of the request for logging with sensitive/large data truncated
-                log_request = litellm_request.copy()
-                
-                # Only log a sample of the messages to avoid overwhelming logs
-                if "messages" in log_request:
-                    sample_messages = []
-                    for i, msg in enumerate(log_request["messages"]):
-                        # For each message, include role and a preview of content
-                        sample_msg = {"role": msg.get("role", "unknown")}
-                        
-                        # Handle different content formats
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            # Show first 100 chars of string content
-                            sample_msg["content"] = content[:100] + ("..." if len(content) > 100 else "")
-                        elif isinstance(content, list):
-                            # For content blocks, just show count and types
-                            types = [block.get("type", "unknown") if isinstance(block, dict) else type(block).__name__ 
-                                    for block in content[:5]]
-                            sample_msg["content"] = f"[{len(content)} blocks: {', '.join(types)}...]"
-                        
-                        sample_messages.append(sample_msg)
-                    
-                    # Replace full messages with sample
-                    log_request["messages"] = sample_messages
-                
-                # Log the request details
-                logger.debug(f"DETAILED REQUEST: {json.dumps(log_request, indent=2)}")
-        else:
-            # Minimal info for normal mode
-            logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
-        
-        # Handle streaming mode
-        if request.stream:
-            # Use LiteLLM for streaming
-            num_tools = len(request.tools) if request.tools else 0
-            
-            log_request_beautifully(
-                "POST", 
-                raw_request.url.path, 
-                display_model, 
-                litellm_request.get('model'),
-                len(litellm_request['messages']),
-                num_tools,
-                200  # Assuming success at this point
-            )
-            # Ensure we use the async version for streaming
-            response_generator = await litellm.acompletion(**litellm_request)
-            
-            return StreamingResponse(
-                handle_streaming(response_generator, request),
-                media_type="text/event-stream"
-            )
-        else:
+        try:
             # Use LiteLLM for regular completion
             num_tools = len(request.tools) if request.tools else 0
             
@@ -1667,123 +2076,27 @@ async def create_message(
                 200  # Assuming success at this point
             )
             
-            # Rich debug for completion call
-            if log_level <= logging.DEBUG or RICH_DEBUG:
-                debug_console.print(Panel(
-                    "[bold cyan]Executing LiteLLM completion call[/bold cyan]",
-                    title="[bold]API Call[/bold]",
-                    border_style="green"
-                ))
+            # Handle streaming mode
+            if request.stream:
+                # Use LiteLLM for streaming
+                response_generator = await litellm.acompletion(**litellm_request)
                 
-                # Create a safe copy of the request for debugging (masking API key)
-                debug_request = litellm_request.copy()
-                if "api_key" in debug_request:
-                    key = debug_request["api_key"]
-                    if key:
-                        debug_request["api_key"] = f"{key[:5]}...{key[-5:]}" if len(key) > 10 else "***masked***"
+                return StreamingResponse(
+                    handle_streaming(response_generator, request),
+                    media_type="text/event-stream"
+                )
+            else:
+                # Non-streaming response
+                litellm_response = litellm.completion(**litellm_request)
                 
-                # Show important parameters
-                debug_table = Table(show_header=True, header_style="bold cyan", title="Request Parameters")
-                debug_table.add_column("Parameter", style="dim")
-                debug_table.add_column("Value")
+                # Convert LiteLLM response to Anthropic format
+                anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
                 
-                for key in ["model", "custom_llm_provider", "base_url", "temperature", "max_tokens"]:
-                    if key in debug_request:
-                        debug_table.add_row(key, str(debug_request[key]))
+                return anthropic_response
                 
-                debug_console.print(debug_table)
-                debug_console.print(f"[bold green]Starting completion call at {datetime.now().strftime('%H:%M:%S')}[/bold green]")
-            
-            start_time = time.time()
-            litellm_response = litellm.completion(**litellm_request)
-            end_time = time.time()
-            
-            if log_level <= logging.DEBUG or RICH_DEBUG:
-                debug_console.print(f"[bold green]✓ Completed in {end_time - start_time:.2f} seconds[/bold green]")
-            
-            logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
-            
-            # Convert LiteLLM response to Anthropic format
-            anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
-            
-            # Log response info based on logging settings
-            if log_level == logging.DEBUG or SHOW_MODEL_DETAILS:
-                # Extract the actual model used from the response
-                actual_model = None
-                model_response_details = {}
-                
-                # Extract detailed model info - this helps identify exactly which model responded
-                if hasattr(litellm_response, "__dict__"):
-                    for field in ["model", "id", "object", "created", "system_fingerprint", "model_version"]:
-                        if hasattr(litellm_response, field):
-                            model_response_details[field] = getattr(litellm_response, field)
-                
-                # Also try dict access for non-object responses
-                if isinstance(litellm_response, dict):
-                    for field in ["model", "id", "object", "created", "system_fingerprint", "model_version"]:
-                        if field in litellm_response and field not in model_response_details:
-                            model_response_details[field] = litellm_response[field]
-                
-                # Log the full model details JSON
-                if model_response_details:
-                    logger.info(f"🔍 DETAILED MODEL INFO: {json.dumps(model_response_details)}")
-                
-                # Set actual_model for normal logging flow
-                if "model" in model_response_details:
-                    actual_model = model_response_details["model"]
-                elif hasattr(litellm_response, "model"):
-                    actual_model = getattr(litellm_response, "model")
-                elif isinstance(litellm_response, dict) and "model" in litellm_response:
-                    actual_model = litellm_response["model"]
-                
-                # Extract content length - first try to get from anthropic_response
-                response_content = ""
-                if hasattr(anthropic_response, "content") and anthropic_response.content:
-                    for block in anthropic_response.content:
-                        if hasattr(block, "type") and block.type == "text" and hasattr(block, "text"):
-                            response_content += block.text
-                
-                # If nothing from anthropic_response, try litellm_response
-                if not response_content and hasattr(litellm_response, "choices") and litellm_response.choices:
-                    if hasattr(litellm_response.choices[0], "message") and hasattr(litellm_response.choices[0].message, "content"):
-                        response_content = litellm_response.choices[0].message.content
-                
-                # Show just the key information at INFO level
-                content_preview = response_content[:50] + "..." if response_content and len(response_content) > 50 else response_content
-                response_summary = f"📥 RESPONSE: Requested='{request.model}', Actual='{actual_model}', Content={len(response_content)} chars"
-                
-                if SHOW_MODEL_DETAILS:
-                    logger.info(f"{response_summary}\nPreview: {content_preview}")
-                else:
-                    logger.debug(f"{response_summary}\nPreview: {content_preview}")
-                
-                # In full debug mode, log the detailed response
-                if log_level == logging.DEBUG:
-                    # Create safe copy for logging with potential large fields truncated
-                    log_response = {}
-                    if hasattr(anthropic_response, "dict"):
-                        log_response = anthropic_response.dict()
-                    else:
-                        # Try to extract key fields if not a Pydantic model
-                        log_response = {
-                            "id": getattr(anthropic_response, "id", None),
-                            "model": getattr(anthropic_response, "model", None), 
-                            "role": getattr(anthropic_response, "role", None),
-                            "stop_reason": getattr(anthropic_response, "stop_reason", None),
-                        }
-                    
-                    # Truncate content for logging
-                    if "content" in log_response:
-                        if isinstance(log_response["content"], list):
-                            for i, block in enumerate(log_response["content"]):
-                                if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
-                                    text = block["text"]
-                                    if len(text) > 500:
-                                        log_response["content"][i]["text"] = text[:500] + "... [truncated]"
-                    
-                    logger.debug(f"DETAILED RESPONSE: {json.dumps(log_response, indent=2)}")
-            
-            return anthropic_response
+        except Exception as e:
+            logger.error(f"Error with LiteLLM API call: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error with model API: {str(e)}")
                 
     except Exception as e:
         import traceback
@@ -1796,102 +2109,14 @@ async def create_message(
             "traceback": error_traceback
         }
         
-        # Check for LiteLLM-specific attributes
-        for attr in ['message', 'status_code', 'response', 'llm_provider', 'model']:
-            if hasattr(e, attr):
-                error_details[attr] = getattr(e, attr)
-        
-        # Special handling for Together.ai API errors
-        is_together_model = False
-        model_value = error_details.get('model')
-        llm_provider = error_details.get('llm_provider')
-        provider_name = "Together.ai"  # Default provider name
-        
-        # Check if this is a Together.ai model error
-        if isinstance(model_value, str) and any(model in model_value for model in TOGETHER_MODELS):
-            is_together_model = True
-        elif llm_provider == 'together_ai':
-            is_together_model = True
-            
-        if is_together_model:
-            logger.error(f"{provider_name} API error: {str(e)}")
-            
-            # Rich console error display for provider errors
-            error_panel = Panel(
-                f"[bold red]{provider_name} API Error:[/bold red]\n" 
-                f"[yellow]{str(e)}[/yellow]\n\n"
-                f"[bold]Possible causes:[/bold]\n"
-                f"• Invalid API key\n"
-                f"• Incorrect base URL\n"
-                f"• Model name format issue\n"
-                f"• Unsupported parameters in request",
-                title=f"[bold red]{provider_name} Error[/bold red]",
-                border_style="red"
-            )
-            debug_console.print(error_panel)
-            
-            # Rich table for error details
-            error_table = Table(show_header=True, header_style="bold red")
-            error_table.add_column("Error Property", style="dim")
-            error_table.add_column("Value")
-            
-            # Add common error properties
-            error_table.add_row("Error Type", type(e).__name__)
-            error_table.add_row("Status Code", str(error_details.get('status_code', 'Unknown')))
-            error_table.add_row("Model", model_value or "Unknown")
-            error_table.add_row("LLM Provider", llm_provider or "Unknown")
-            
-            # Add diagnostic information
-            if "base_url" in litellm_request:
-                error_table.add_row("Base URL", litellm_request.get("base_url", "Not set"))
-            else:
-                error_table.add_row("Base URL", "[bold red]Missing - this may be the issue![/bold red]")
-                
-            if "custom_llm_provider" in litellm_request:
-                error_table.add_row("Custom Provider", litellm_request.get("custom_llm_provider", "Not set"))
-            else:
-                error_table.add_row("Custom Provider", "[bold red]Missing - this may be the issue![/bold red]")
-            
-            # Display the error details
-            debug_console.print(error_table)
-            
-            # Check if it's a rate limit or authentication error
-            if hasattr(e, 'status_code'):
-                if e.status_code == 429:
-                    error_details["provider_error"] = f"Rate limit exceeded. Please try again later."
-                elif e.status_code == 401:
-                    error_details["provider_error"] = f"Authentication failed. Please check your {provider_name} API key."
-                elif e.status_code == 404:
-                    error_details["provider_error"] = f"Model not found. Please check if the model name is correct."
-        
-        # Check for additional exception details in dictionaries
-        if hasattr(e, '__dict__'):
-            for key, value in e.__dict__.items():
-                if key not in error_details and key not in ['args', '__traceback__']:
-                    error_details[key] = str(value)
-        
-        # Make error details JSON serializable by converting problematic objects to strings
-        for key, value in list(error_details.items()):
-            try:
-                # Test if value is JSON serializable
-                json.dumps({key: value})
-            except (TypeError, OverflowError):
-                # If not serializable, convert to string
-                error_details[key] = f"[Non-serializable {type(value).__name__}]: {str(value)}"
-        
         # Log all error details
         logger.error(f"Error processing request: {json.dumps(error_details, indent=2)}")
         
         # Format error for response
         error_message = f"Error: {str(e)}"
-        if 'message' in error_details and error_details['message']:
-            error_message += f"\nMessage: {error_details['message']}"
-        if 'response' in error_details and error_details['response']:
-            error_message += f"\nResponse: {error_details['response']}"
         
         # Return detailed error
-        status_code = error_details.get('status_code', 500)
-        raise HTTPException(status_code=status_code, detail=error_message)
+        raise HTTPException(status_code=500, detail=error_message)
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(
@@ -1984,6 +2209,38 @@ async def count_tokens(
                         debug_console.print("[bold yellow]⚠️ Warnings:[/bold yellow]")
                         for warning in warnings:
                             debug_console.print(f" • {warning}")
+                
+                # Use OpenAI client directly when preferred provider is "together"
+                if PREFERRED_PROVIDER == "together":
+                    try:
+                        # Initialize the OpenAI client with Together.ai endpoint
+                        openai_client = openai.OpenAI(
+                            base_url=converted_request["base_url"],
+                            api_key=TOGETHERAI_API_KEY
+                        )
+                        
+                        # Convert messages format for OpenAI
+                        openai_request = {
+                            "model": converted_request["model"],
+                            "messages": converted_request["messages"]
+                        }
+                        
+                        if log_level <= logging.DEBUG or RICH_DEBUG:
+                            debug_console.print(Panel(
+                                f"[bold green]Using OpenAI client directly for {provider_name} token counting[/bold green]",
+                                border_style="green"
+                            ))
+                        
+                        # Use client token counting method
+                        token_count_response = openai_client.chat.completions.create(**openai_request, max_tokens=0)
+                        token_count = token_count_response.usage.prompt_tokens
+                        
+                        # Return the token count
+                        return TokenCountResponse(input_tokens=token_count)
+                    except Exception as e:
+                        logger.error(f"Error using OpenAI client for token counting: {str(e)}")
+                        # Fall back to LiteLLM token counting
+                        logger.info("Falling back to LiteLLM token counting")
             
             # Count tokens
             token_count = token_counter(

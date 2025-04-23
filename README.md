@@ -4,7 +4,6 @@
 
 A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Together.ai models via LiteLLM. 🌉
 
-# NOTE: Together AI detects tools, returns response but it gets converted to text? not working currently.
 
 ![Anthropic API Proxy](pic.png)
 
